@@ -1,0 +1,63 @@
+#!/bin/bash
+# lock-api: lock the YouTube Music app's API server (127.0.0.1:26538) to the
+# nic.youtube-music bar widget.
+#
+# Why: with authStrategy NONE the app's API answers any caller, and its CORS
+# allows every origin, so a web page served from your local network (a router
+# page, say) or any local program could like songs on your account, queue or
+# play things. Browsers ask before a public page reaches 127.0.0.1, but not
+# for pages from a private address.
+#
+# What it does, once: while the app still runs with NONE, it mints a token for
+# a random client id (POST /auth/<id> adds the id to the app's authorized
+# clients and returns a JWT signed with the app's own secret), saves it mode 600
+# in ~/.local/state/omarchy/nic-youtube-music/token (the widget sends it as a
+# Bearer header and ?token= on its WebSocket), quits the app over the debug
+# port, and switches config.json to AUTH_AT_FIRST while the app is closed (the
+# app rewrites config.json when it quits). An unknown caller then gets 401, or
+# an allow/deny prompt on /auth that defaults to deny.
+#
+# Undo: set authStrategy back to "NONE" in ~/.config/YouTube Music/config.json
+# while the app is closed.
+set -euo pipefail
+cfg="$HOME/.config/YouTube Music/config.json"
+tok="$HOME/.local/state/omarchy/nic-youtube-music/token"
+api=http://127.0.0.1:26538
+app_pat='^/opt/YouTube Music/youtube-music --remote'
+
+up() { curl -fsS -o /dev/null -m 2 "$@" "$api/api/v1/volume" 2>/dev/null; }
+wait_for() { for _ in $(seq 1 "$2"); do eval "$1" && return 0; sleep 0.5; done; return 1; }
+
+[[ -f $cfg ]] || { echo "No $cfg: start YouTube Music once and sign in first." >&2; exit 1; }
+strategy=$(jq -r '.plugins["api-server"].authStrategy // "NONE"' "$cfg")
+
+if [[ $strategy == AUTH_AT_FIRST && -s $tok ]]; then
+  echo "Already locked (AUTH_AT_FIRST, token present)."
+  exit 0
+fi
+
+# 1. The app must be running with auth NONE to mint a token without a prompt.
+if [[ $strategy != NONE ]]; then
+  if pgrep -f "$app_pat" >/dev/null; then echo "Quit YouTube Music first: omarchy-shell nic.youtube-music quit" >&2; exit 1; fi
+  jq '.plugins["api-server"].authStrategy = "NONE"' "$cfg" > "$cfg.tmp" && mv "$cfg.tmp" "$cfg"
+fi
+if ! up; then
+  omarchy-shell -q nic.youtube-music wake
+  wait_for up 60 || { echo "YouTube Music's API did not come up." >&2; exit 1; }
+fi
+
+# 2. Mint and save the token.
+id="nic-bar-$(openssl rand -hex 16)"
+token=$(curl -fsS -m 10 -X POST "$api/auth/$id" | jq -r '.accessToken // empty')
+[[ -n $token ]] || { echo "The app gave no token." >&2; exit 1; }
+mkdir -p "${tok%/*}"
+( umask 077; printf '%s\n' "$token" > "$tok.tmp" ) && mv "$tok.tmp" "$tok"
+up -H "Authorization: Bearer $token" || { echo "The new token does not work." >&2; exit 1; }
+
+# 3. Quit the app cleanly (Browser.close over the debug port, never a kill:
+# Chromium crashes on purpose on SIGTERM), then switch to AUTH_AT_FIRST.
+omarchy-shell -q nic.youtube-music quit
+wait_for '! pgrep -f "$app_pat" >/dev/null' 40 || { echo "YouTube Music did not quit; switch authStrategy by hand once it has." >&2; exit 1; }
+sleep 1
+jq '.plugins["api-server"].authStrategy = "AUTH_AT_FIRST"' "$cfg" > "$cfg.tmp" && mv "$cfg.tmp" "$cfg"
+echo "Locked: authStrategy AUTH_AT_FIRST, token in $tok. The widget starts the app again when needed."

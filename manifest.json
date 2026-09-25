@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "id": "nic.youtube-music",
+  "name": "YouTube Music",
+  "version": "2.2.0",
+  "author": "nicolasfalesy (built on Omarchy's Media widget)",
+  "license": "MIT",
+  "description": "Full remote for the YouTube Music desktop app (pear-desktop): now playing, up next, search, library and playlists, queue, like, shuffle, repeat, volume, and word-by-word lyrics. Starts the app in the background on demand and quits it when idle.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Widget.qml"
+  },
+  "barWidget": {
+    "displayName": "YouTube Music",
+    "description": "Equalizer plus the song. Click for the full panel; right click play/pause; middle click next.",
+    "category": "Media",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "showTitle": true,
+      "maxLabelWidth": 150,
+      "idleMinutes": 5
+    }
+  }
+}
