@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+"""cdp-bridge: start the YouTube Music app with its DevTools protocol on a
+private pipe, and hand that pipe to the bar widget over a Unix socket that only
+this user can open.
+
+Why: the widget needs the DevTools protocol to read the library, search, the
+queue and the real play state (the app's API server cannot do those). The
+usual way to get it, --remote-debugging-port, opens an unauthenticated TCP port
+on 127.0.0.1 that gives ANY local program or user full control of the signed-in
+app, cookies included. Chromium's --remote-debugging-pipe speaks the same
+protocol over two inherited file descriptors instead (the app reads commands on
+fd 3 and writes answers on fd 4), so no port exists at all. This program is the
+app's parent and the only holder of those pipes. It serves them on
+$XDG_RUNTIME_DIR/nic-youtube-music/cdp.sock: the folder is 0700 and the socket
+0600, and each connection's peer uid is checked, so other users cannot reach it.
+
+Framing: the pipe separates messages with a NUL byte; the socket uses a
+newline, which JSON text never contains raw, so the widget can split lines.
+
+It also refuses to pass on any --remote-debugging-* flag from
+~/.config/youtube-music-flags.conf, so a leftover port line from an older setup
+cannot reopen the port.
+
+Usage: cdp-bridge [extra app arguments...]
+Started by the widget when the app is needed, and by the app's menu entry
+(tools/setup installs one), so the app is never started with an open port.
+"""
+
+import os
+import select
+import signal
+import socket
+import stat
+import struct
+import sys
+import time
+
+APP = os.environ.get("NIC_YTM_APP", "/opt/YouTube Music/youtube-music")
+FLAGS_FILE = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+                          "youtube-music-flags.conf")
+MAX_PENDING = 256 * 1024 * 1024  # bytes without a separator before a peer is dropped
+
+
+def die(msg, code=1):
+    print("cdp-bridge: " + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def private_dir():
+    rt = os.environ.get("XDG_RUNTIME_DIR", "")
+    if not rt:
+        die("XDG_RUNTIME_DIR is not set")
+    st = os.lstat(rt)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+        die("XDG_RUNTIME_DIR is not a private directory owned by this user")
+    d = os.path.join(rt, "nic-youtube-music")
+    try:
+        os.mkdir(d, 0o700)
+    except FileExistsError:
+        pass
+    st = os.lstat(d)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+        die(d + " is not a directory owned by this user")
+    os.chmod(d, 0o700)
+    return d
+
+
+def app_argv(extra):
+    flags = []
+    try:
+        with open(FLAGS_FILE, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                for word in line.split():
+                    if word.startswith("--remote-debugging-"):
+                        print("cdp-bridge: ignoring " + word + " from " + FLAGS_FILE
+                              + " (the debugging channel is the private pipe)", file=sys.stderr)
+                        continue
+                    flags.append(word)
+    except OSError:
+        pass
+    return [APP] + flags + ["--remote-debugging-pipe"] + list(extra)
+
+
+def peer_uid(conn):
+    creds = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+    return struct.unpack("3i", creds)[1]
+
+
+def main():
+    d = private_dir()
+    path = os.path.join(d, "cdp.sock")
+
+    # One bridge (so one app) at a time. A socket that answers means it runs.
+    if os.path.exists(path):
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            probe.connect(path)
+            probe.close()
+            return 0
+        except OSError:
+            os.unlink(path)
+
+    to_app_r, to_app_w = os.pipe()        # app reads commands on fd 3
+    from_app_r, from_app_w = os.pipe()    # app writes answers on fd 4
+    argv = app_argv(sys.argv[1:])
+    env = dict(os.environ, ELECTRON_IS_DEV="0")
+
+    pid = os.fork()
+    if pid == 0:
+        try:
+            # Park the pipe ends above 4 first so dup2 cannot clobber one with the other.
+            a = os.dup(to_app_r)
+            b = os.dup(from_app_w)
+            os.dup2(a, 3)
+            os.dup2(b, 4)
+            devnull = os.open(os.devnull, os.O_RDWR)
+            for fd in (0, 1, 2):
+                os.dup2(devnull, fd)
+            os.closerange(5, 1 << 16)
+            os.set_inheritable(3, True)
+            os.set_inheritable(4, True)
+            os.execve(argv[0], argv, env)
+        except Exception:
+            os._exit(127)
+    os.close(to_app_r)
+    os.close(from_app_w)
+
+    old_umask = os.umask(0o177)
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(path)
+    os.umask(old_umask)
+    os.chmod(path, 0o600)
+    server.listen(4)
+
+    stopping = []
+    # Never forward a TERM to the app: Chromium crashes on purpose on SIGTERM.
+    # The widget quits it with Browser.close over this socket instead.
+    signal.signal(signal.SIGTERM, lambda *_: stopping.append(1))
+    signal.signal(signal.SIGINT, lambda *_: stopping.append(1))
+    signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+
+    client = None
+    from_app = b""
+    from_client = b""
+    try:
+        while not stopping:
+            done, _status = os.waitpid(pid, os.WNOHANG)
+            if done:
+                break
+            watch = [server, from_app_r] + ([client] if client else [])
+            try:
+                ready, _, _ = select.select(watch, [], [], 1.0)
+            except InterruptedError:
+                continue
+            if server in ready:
+                conn, _ = server.accept()
+                if peer_uid(conn) != os.getuid():
+                    conn.close()
+                else:
+                    # The newest connection wins: a reloaded widget replaces
+                    # the old one rather than queueing behind it.
+                    if client:
+                        client.close()
+                    client, from_client = conn, b""
+            if from_app_r in ready:
+                chunk = os.read(from_app_r, 1 << 20)
+                if not chunk:
+                    break  # the app closed its end: it is quitting
+                from_app += chunk
+                *messages, from_app = from_app.split(b"\0")
+                if len(from_app) > MAX_PENDING:
+                    from_app = b""
+                if client and messages:
+                    try:
+                        client.sendall(b"".join(m + b"\n" for m in messages))
+                    except OSError:
+                        client.close()
+                        client = None
+            if client and client in ready:
+                try:
+                    chunk = client.recv(1 << 20)
+                except OSError:
+                    chunk = b""
+                if not chunk:
+                    client.close()
+                    client = None
+                    continue
+                from_client += chunk
+                *lines, from_client = from_client.split(b"\n")
+                if len(from_client) > MAX_PENDING:
+                    client.close()
+                    client, from_client = None, b""
+                for line in lines:
+                    if line.strip():
+                        os.write(to_app_w, line + b"\0")
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        server.close()
+        if client:
+            client.close()
+        os.close(to_app_w)
+        os.close(from_app_r)
+    # Reap the app when it exits so it never lingers as a zombie.
+    for _ in range(50):
+        if os.waitpid(pid, os.WNOHANG)[0]:
+            break
+        time.sleep(0.1)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -32,84 +32,84 @@ hidden in the background, starts when you need it, and quits when you don't.
 
 ## Setup
 
-1. **Install the app** and sign in to your account once:
+1. **Install the app**, start it once from the app launcher, sign in to your account, and quit
+   it:
 
    ```bash
    yay -S pear-desktop-bin
    ```
 
-2. **Turn on its API server, local only.** Quit the app first (it rewrites its config when it
-   quits), then:
-
-   ```bash
-   cfg="$HOME/.config/YouTube Music/config.json"
-   jq '.plugins["api-server"] = ((.plugins["api-server"] // {}) + {enabled: true, hostname: "127.0.0.1", port: 26538, authStrategy: "NONE", useHttps: false})
-       | .options.resumeOnStart = false | .options.tray = false | .options.startAtLogin = false' \
-     "$cfg" > "$cfg.tmp" && mv "$cfg.tmp" "$cfg"
-   ```
-
-   `resumeOnStart` off keeps the app from starting music by itself; the widget does the
-   resuming.
-
-3. **Open its debug port, local only.** The widget reads your library, playlists, queue and the
-   real play state through it. Put this in `~/.config/youtube-music-flags.conf`:
-
-   ```
-   --remote-debugging-port=9223
-   --remote-debugging-address=127.0.0.1
-   ```
-
-4. **Hide its window** on the music workspace. Add this to `~/.config/hypr/hyprland.lua`:
-
-   ```lua
-   o.window("com.github.th-ch.youtube-music", { workspace = "special:music silent" })
-   ```
-
-5. **Add the plugin:**
+2. **Add the plugin:**
 
    ```bash
    omarchy plugin add https://github.com/nicolasfalesy/omarchy-youtube-music.git --enable
    ```
 
-6. **Optional, recommended: lock the API to the widget.** With `authStrategy` `NONE`, any local
-   program or web page can drive the app's API. `tools/lock-api` mints a token for the widget
-   (saved mode 600 in `~/.local/state/omarchy/nic-youtube-music/token`) and switches the app to
-   `AUTH_AT_FIRST`, so anything else gets refused:
+3. **Hide the app's window** on the music workspace. Add this to `~/.config/hypr/hyprland.lua`:
+
+   ```lua
+   o.window("com.github.th-ch.youtube-music", { workspace = "special:music silent" })
+   ```
+
+4. **Run the setup once** (safe to run again):
 
    ```bash
-   ~/.config/omarchy/plugins/nic.youtube-music/tools/lock-api
+   ~/.config/omarchy/plugins/nic.youtube-music/tools/setup
    ```
+
+   It turns on the app's API server (local only) and **locks it to this widget**: it mints a
+   token only the widget holds (saved mode 600 in `~/.local/state/omarchy/nic-youtube-music/token`)
+   and switches the app to `AUTH_AT_FIRST`, so any other program, or a web page, is refused. It
+   also adds a menu entry that starts the app through `tools/cdp-bridge` (see below), removes
+   any old `--remote-debugging-port` line from `~/.config/youtube-music-flags.conf`, and turns
+   off the app's `resumeOnStart`, tray and start-at-login (the widget does the resuming, and
+   quits the app when idle). If the app's API ever answers without the token again, the panel
+   says so.
+
+### How the widget reaches the app, and why no port is open
+
+The widget needs the app's DevTools protocol to read your library, playlists, the queue and the
+real play state (the app's own API cannot). The usual way to get it,
+`--remote-debugging-port`, opens an unauthenticated port that gives every local program and user
+full control of the signed-in app, cookies included. So this plugin never uses a port.
+`tools/cdp-bridge` starts the app with Chromium's `--remote-debugging-pipe`: the protocol runs
+over two file descriptors that only the bridge holds, and the bridge passes it to the widget on
+a Unix socket in `$XDG_RUNTIME_DIR/nic-youtube-music/` (folder 0700, socket 0600, and each
+connection's user is checked). The widget starts the app through the bridge, and so does the
+menu entry from step 4.
+
+If the app is started some other way (for example `youtube-music` from a terminal), it runs
+without the pipe: playback controls still work over the API, but the library, search, queue and
+lyrics timing do not until it is quit and started again from the widget or the menu.
 
 ## Dependencies
 
 - Omarchy 4 (the Quickshell `omarchy-shell` and Lua Hyprland config).
 - [pear-desktop](https://github.com/pear-devs/pear-desktop) (`pear-desktop-bin` from the AUR),
   signed in to a YouTube Music account.
-- `jq`, `curl` and `openssl`, only for `tools/lock-api` and the World Radio link (Omarchy ships
-  all three).
+- `python3` for `tools/cdp-bridge`, and `jq`, `curl` and `openssl` for `tools/setup` and
+  `tools/lock-api` (Omarchy ships all four).
 
 ## Remove
 
 ```bash
 omarchy plugin remove nic.youtube-music
 rm -rf ~/.local/state/omarchy/nic-youtube-music
+rm -f ~/.local/share/applications/com.github.th-ch.youtube-music.desktop
 ```
 
-Then undo the setup steps you no longer want: delete `~/.config/youtube-music-flags.conf`,
-remove the `o.window(...)` line from `~/.config/hypr/hyprland.lua`, and turn the app's API
-server off again (or set its `authStrategy` back to `NONE` if you ran `tools/lock-api`), with
-the app closed.
+Then remove the `o.window(...)` line from `~/.config/hypr/hyprland.lua`, and, with the app
+closed, turn its API server off in `~/.config/YouTube Music/config.json` (or leave it on: it
+stays locked to a token nothing holds any more).
 
 ## What it sends where
 
-- The app: `127.0.0.1:26538` (API) and `127.0.0.1:9223` (debug port). Nothing else.
+- The app: its API on `127.0.0.1:26538` (token-locked), and the DevTools protocol over the
+  private socket described above. No debug port.
 - Lyrics, only while the Lyrics tab is open: the song's title, first artist and length go to
   [LRCLIB](https://lrclib.net) (plus the album) and to KuGou (`krcs.kugou.com`,
   `lyrics.kugou.com`), which has the word timing. Without either, YouTube Music's own lyrics
   show.
-
-The debug port gives full control of the app to any program on your machine, which is why it
-is bound to `127.0.0.1`.
 
 ## IPC
 
@@ -122,8 +122,12 @@ If the `nic.world-radio` plugin is installed too, starting either one stops the 
 
 ## Notes for hacking on it
 
-- Quit the app with the `quit` IPC (Browser.close over the debug port). A plain kill makes
+- Quit the app with the `quit` IPC (Browser.close through the bridge). A plain kill makes
   Chromium crash on purpose and shows a crash notice.
+- `tools/cdp-bridge` is the app's parent and the only holder of its debugging pipe. The socket
+  speaks one JSON message per line (the pipe itself separates them with a NUL byte), and the
+  connection is browser-level: the widget attaches to the YouTube Music page with
+  `Target.attachToTarget` (flatten) and sends page commands with that `sessionId`.
 - `Page.js` is the code the widget runs inside the app's page. Keep it free of any work at load
   time: building its text at load time set off a Qt 6.11 garbage-collector crash at shell start.
   The why is at the top of the file.

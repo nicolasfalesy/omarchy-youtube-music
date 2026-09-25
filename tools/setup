@@ -1,0 +1,89 @@
+#!/bin/bash
+# setup: everything the nic.youtube-music widget needs from the YouTube Music
+# app (pear-desktop), in the locked-down form. Safe to run again.
+#
+#   1. The app's API server on, local only, with authentication: tools/lock-api
+#      mints a token that only this widget holds and switches the app to
+#      AUTH_AT_FIRST, so any other program (or a web page on the local network:
+#      the API allows every origin) is refused.
+#   2. No debug port. The widget reaches the DevTools protocol through
+#      tools/cdp-bridge, which starts the app with --remote-debugging-pipe and
+#      serves it on a Unix socket only this user can open. An open
+#      --remote-debugging-port would give every local program and user full
+#      control of the signed-in app, so this removes any such line from
+#      ~/.config/youtube-music-flags.conf (older versions of this plugin told
+#      you to add one).
+#   3. A menu entry that starts the app through the bridge, so starting it from
+#      the app launcher gives the widget its pipe too (and still no port).
+#   4. resumeOnStart, tray and startAtLogin off: the widget does the resuming,
+#      and the app quits when idle.
+#
+# Run it with the app signed in once (start it from the launcher, sign in,
+# quit it). Undo: see "Remove" in README.md.
+set -euo pipefail
+
+here=$(cd "$(dirname "$0")" && pwd)
+app="/opt/YouTube Music/youtube-music"
+cfg="$HOME/.config/YouTube Music/config.json"
+flags="${XDG_CONFIG_HOME:-$HOME/.config}/youtube-music-flags.conf"
+apps="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+entry="$apps/com.github.th-ch.youtube-music.desktop"
+
+say() { printf '%s\n' "$*"; }
+app_running() {
+  local p
+  for p in $(pgrep -f "^$app" || true); do
+    tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -q -- '--type=' || return 0
+  done
+  return 1
+}
+
+[[ -x $app ]] || { say "YouTube Music (pear-desktop) is not installed. Install it first:  yay -S pear-desktop-bin" >&2; exit 1; }
+[[ -s $cfg ]] || { say "Start YouTube Music once from the launcher and sign in, quit it, then run this again." >&2; exit 1; }
+for tool in jq curl openssl python3; do
+  command -v "$tool" >/dev/null || { say "Missing $tool." >&2; exit 1; }
+done
+
+# The app rewrites config.json when it quits, so edits happen with it closed.
+if app_running; then
+  say "Quitting YouTube Music so its settings can be changed..."
+  omarchy-shell -q nic.youtube-music quit || true
+  for _ in $(seq 1 40); do app_running || break; sleep 0.5; done
+  app_running && { say "YouTube Music did not quit; quit it and run this again." >&2; exit 1; }
+  sleep 1
+fi
+
+# 2. No debug port.
+if [[ -f $flags ]] && grep -q -- '--remote-debugging-' "$flags"; then
+  cp -- "$flags" "$flags.bak.$(date +%s)"
+  grep -v -- '--remote-debugging-' "$flags" > "$flags.tmp" || true
+  mv -- "$flags.tmp" "$flags"
+  say "Removed the debug-port lines from $flags (a backup is next to it)."
+fi
+
+# 4. and the API server's place. authStrategy is left to lock-api: it has to
+# be NONE for the one moment it takes to mint the token.
+jq '.plugins["api-server"] = ((.plugins["api-server"] // {}) + {enabled: true, hostname: "127.0.0.1", port: 26538, useHttps: false})
+    | .options.resumeOnStart = false | .options.tray = false | .options.startAtLogin = false' \
+  "$cfg" > "$cfg.tmp" && mv -- "$cfg.tmp" "$cfg"
+
+# 3. The menu entry. A user entry with the same name hides the packaged one.
+mkdir -p -- "$apps"
+cat > "$entry.tmp" <<EOF
+[Desktop Entry]
+Name=YouTube Music
+Comment=YouTube Music, started for the nic.youtube-music bar widget (private debugging pipe, no port)
+Exec="$here/cdp-bridge" %U
+Terminal=false
+Type=Application
+Icon=youtube-music
+StartupWMClass=com.github.th-ch.youtube-music
+Categories=AudioVideo;
+EOF
+mv -- "$entry.tmp" "$entry"
+say "Menu entry: $entry"
+
+# 1. Lock the API (mints the token while the app briefly runs with NONE).
+"$here/lock-api"
+
+say "Done. Also add the window rule from README.md step 3 if you have not yet."

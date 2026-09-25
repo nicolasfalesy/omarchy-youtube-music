@@ -12,8 +12,9 @@
 # a random client id (POST /auth/<id> adds the id to the app's authorized
 # clients and returns a JWT signed with the app's own secret), saves it mode 600
 # in ~/.local/state/omarchy/nic-youtube-music/token (the widget sends it as a
-# Bearer header and ?token= on its WebSocket), quits the app over the debug
-# port, and switches config.json to AUTH_AT_FIRST while the app is closed (the
+# Bearer header and ?token= on its WebSocket), quits the app (Browser.close
+# through tools/cdp-bridge), and switches config.json to AUTH_AT_FIRST while the
+# app is closed (the
 # app rewrites config.json when it quits). An unknown caller then gets 401, or
 # an allow/deny prompt on /auth that defaults to deny.
 #
@@ -23,7 +24,16 @@ set -euo pipefail
 cfg="$HOME/.config/YouTube Music/config.json"
 tok="$HOME/.local/state/omarchy/nic-youtube-music/token"
 api=http://127.0.0.1:26538
-app_pat='^/opt/YouTube Music/youtube-music --remote'
+app="/opt/YouTube Music/youtube-music"
+# The app's main process: the one without --type= (the rest are its helpers).
+# Its flags differ by how it was started, so match the path alone.
+app_running() {
+  local p
+  for p in $(pgrep -f "^$app" || true); do
+    tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -q -- '--type=' || return 0
+  done
+  return 1
+}
 
 up() { curl -fsS -o /dev/null -m 2 "$@" "$api/api/v1/volume" 2>/dev/null; }
 wait_for() { for _ in $(seq 1 "$2"); do eval "$1" && return 0; sleep 0.5; done; return 1; }
@@ -38,7 +48,7 @@ fi
 
 # 1. The app must be running with auth NONE to mint a token without a prompt.
 if [[ $strategy != NONE ]]; then
-  if pgrep -f "$app_pat" >/dev/null; then echo "Quit YouTube Music first: omarchy-shell nic.youtube-music quit" >&2; exit 1; fi
+  if app_running; then echo "Quit YouTube Music first: omarchy-shell nic.youtube-music quit" >&2; exit 1; fi
   jq '.plugins["api-server"].authStrategy = "NONE"' "$cfg" > "$cfg.tmp" && mv "$cfg.tmp" "$cfg"
 fi
 if ! up; then
@@ -54,10 +64,10 @@ mkdir -p "${tok%/*}"
 ( umask 077; printf '%s\n' "$token" > "$tok.tmp" ) && mv "$tok.tmp" "$tok"
 up -H "Authorization: Bearer $token" || { echo "The new token does not work." >&2; exit 1; }
 
-# 3. Quit the app cleanly (Browser.close over the debug port, never a kill:
+# 3. Quit the app cleanly (Browser.close through the bridge, never a kill:
 # Chromium crashes on purpose on SIGTERM), then switch to AUTH_AT_FIRST.
 omarchy-shell -q nic.youtube-music quit
-wait_for '! pgrep -f "$app_pat" >/dev/null' 40 || { echo "YouTube Music did not quit; switch authStrategy by hand once it has." >&2; exit 1; }
+wait_for '! app_running' 40 || { echo "YouTube Music did not quit; switch authStrategy by hand once it has." >&2; exit 1; }
 sleep 1
 jq '.plugins["api-server"].authStrategy = "AUTH_AT_FIRST"' "$cfg" > "$cfg.tmp" && mv "$cfg.tmp" "$cfg"
 echo "Locked: authStrategy AUTH_AT_FIRST, token in $tok. The widget starts the app again when needed."

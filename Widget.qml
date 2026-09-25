@@ -19,18 +19,21 @@ import "Page.js" as Page
 // a safe resume, queue rows acted on by id, keyboard control and tooltips, and
 // removed a reconnect loop that kept a CPU core busy. The why is at each change.
 //
-// Two local connections, both bound to 127.0.0.1 only:
+// Two private connections to the app:
 //   - The app's API server plugin (127.0.0.1:26538, set in
 //     ~/.config/YouTube Music/config.json; see README.md for the keys). REST for commands, and a WebSocket (/api/v1/ws) that pushes
 //     song, play state, position, volume, repeat and shuffle live, so nothing
-//     here polls while music plays. Auth is NONE today. When
-//     ~/.local/state/omarchy/nic-youtube-music/token holds a token, every
-//     request sends it (a Bearer header, and ?token= on the socket), so the app
-//     can move to AUTH_AT_FIRST without another edit here.
-//   - The app's debug port (9223, set in ~/.config/youtube-music-flags.conf),
-//     used for what the API cannot do or gets wrong: list the library, open
-//     albums, playlists and artists, page long lists, act on queue rows by id,
-//     and read the player's real state. See Page.js.
+//     here polls while music plays. tools/setup locks it to this widget
+//     (AUTH_AT_FIRST): every request sends the token in
+//     ~/.local/state/omarchy/nic-youtube-music/token (a Bearer header, and
+//     ?token= on the socket), and any other caller is refused. An app still on
+//     auth NONE gets a warning in the panel.
+//   - The DevTools protocol over a private pipe (tools/cdp-bridge starts the
+//     app with --remote-debugging-pipe and serves it on a user-only Unix
+//     socket; no debug port is ever opened), used for what the API cannot do
+//     or gets wrong: list the library, open albums, playlists and artists,
+//     page long lists, act on queue rows by id, and read the player's real
+//     state. See Page.js.
 //
 // The app's own word on "playing" is not trusted. It marks every newly loaded
 // song as playing (isPaused false) and never reports a play or pause at 0:00,
@@ -64,7 +67,6 @@ Panel {
   manageIpc: false
 
   readonly property string api: "http://127.0.0.1:26538/api/v1"
-  readonly property string cdpList: "http://127.0.0.1:9223/json"
   readonly property string appClass: "com.github.th-ch.youtube-music"
   // Its own folder, not ~/.local/state/omarchy itself: the shell watches three
   // folders there (toggles, indicators, current), and a FileView on a folder
@@ -347,6 +349,7 @@ Panel {
     var ps = peers()
     for (var i = 0; i < ps.length; i++) if (ps[i]) ps[i].idleSeconds = 0
     idleSeconds = 0
+    if (opened && apiOpen) warnApiOpen()
   }
 
   // One copy of this widget runs per monitor (Bar.qml builds a bar per
@@ -543,7 +546,8 @@ Panel {
   Timer {
     id: launchTimer
     interval: 600
-    onTriggered: if (!root.appUp) Quickshell.execDetached(["setsid", "-f", "youtube-music"])
+    // Through the bridge, so the app runs with the private pipe and no port.
+    onTriggered: if (!root.appUp) Quickshell.execDetached(["setsid", "-f", root.bridgePath])
   }
   Timer {
     id: startTimeout
@@ -834,26 +838,13 @@ Panel {
       root.quitApp()
     })
   }
+  // Browser.close over the bridge's socket. Never a kill: Chromium crashes on
+  // purpose on SIGTERM and shows a crash notice.
   function quitApp() {
     saveLast()
-    var x = new XMLHttpRequest()
-    x.onreadystatechange = function() {
-      if (x.readyState !== XMLHttpRequest.DONE) return
-      try {
-        quitWs.url = JSON.parse(x.responseText).webSocketDebuggerUrl
-        quitWs.active = true
-      } catch (e) {}
-    }
-    x.open("GET", "http://127.0.0.1:9223/json/version")
-    x.send()
-  }
-  WebSocket {
-    id: quitWs
-    active: false
-    onStatusChanged: {
-      if (quitWs.status === WebSocket.Open) quitWs.sendTextMessage(JSON.stringify({ id: 1, method: "Browser.close" }))
-      else if (quitWs.status === WebSocket.Closed || quitWs.status === WebSocket.Error) quitWs.active = false
-    }
+    if (cdpSock.connected) { root.cdpBare("Browser.close", {}, null); return }
+    root.cdpQuitPending = true
+    cdpSock.connected = true
   }
   // With nothing of the user's loaded, the seek bar moves the remembered song's
   // resume point instead (a /seek-to on an empty or cued player did nothing).
@@ -1178,8 +1169,29 @@ Panel {
     onTriggered: root.probe()
   }
   // The app's API answered (see the socket's Open branch for why not sooner).
+  // Authenticated by default: tools/setup switches the app's API server to
+  // AUTH_AT_FIRST with a token only this widget holds. If the app still
+  // answers a request WITHOUT the token, any local program (and any web page
+  // on the local network: the API allows every origin) can drive the signed-in
+  // account, so the panel says how to lock it.
+  property bool apiOpen: false
+  function checkApiLock() {
+    var x = new XMLHttpRequest()
+    x.onreadystatechange = function() {
+      if (x.readyState !== XMLHttpRequest.DONE) return
+      root.apiOpen = x.status === 200
+      if (root.apiOpen && root.opened) root.warnApiOpen()
+    }
+    x.open("GET", root.api + "/volume")
+    x.send()
+  }
+  function warnApiOpen() {
+    toastFor("The app's API answers any program. Run tools/setup in the plugin folder to lock it.", 8000)
+  }
+
   function markUp() {
     appUp = true
+    checkApiLock()
     starting = false
     startFailed = false
     idleSeconds = 0
@@ -1319,38 +1331,81 @@ Panel {
     cdpQueue = []
     for (var k in p) p[k](null, err)
   }
-  WebSocket {
-    id: cdp
-    active: false
-    onStatusChanged: {
-      if (cdp.status === WebSocket.Open) {
-        var q = root.cdpQueue
-        root.cdpQueue = []
-        for (var i = 0; i < q.length; i++) cdp.sendTextMessage(q[i].msg)
-      } else if (cdp.status === WebSocket.Closed || cdp.status === WebSocket.Error) {
-        active = false
-        root.cdpFail("The YouTube Music page is not reachable.")
-      }
+  // The DevTools protocol reaches the app over a private pipe, never a port.
+  // tools/cdp-bridge starts the app with --remote-debugging-pipe and serves
+  // that pipe on $XDG_RUNTIME_DIR/nic-youtube-music/cdp.sock (folder 0700,
+  // socket 0600, peer uid checked), one JSON message per line. An open
+  // --remote-debugging-port would give any local program or user full control
+  // of the signed-in app, cookies included (the reason the marketplace review
+  // asked for it to go). The pipe's connection is browser-level, so page
+  // commands run in a session: Target.getTargets finds the YouTube Music page
+  // (or pear's offline page), Target.attachToTarget with flatten gives a
+  // sessionId, and every page command carries it.
+  readonly property string pluginDir: String(Qt.resolvedUrl(".")).replace(/^file:\/\//, "").replace(/\/$/, "")
+  readonly property string bridgePath: pluginDir + "/tools/cdp-bridge"
+  readonly property string cdpSockPath: Quickshell.env("XDG_RUNTIME_DIR") + "/nic-youtube-music/cdp.sock"
+  property string cdpSession: ""
+  property string cdpSessionKind: ""      // "music" or "offline"
+  property bool cdpAttaching: false
+  property bool cdpQuitPending: false
+
+  Socket {
+    id: cdpSock
+    path: root.cdpSockPath
+    connected: false
+    parser: SplitParser {
+      splitMarker: "\n"
+      onRead: function(line) { root.cdpReceive(line) }
     }
-    onTextMessageReceived: function(message) {
-      var m
-      try { m = JSON.parse(message) } catch (e) { return }
-      var cb = root.cdpPending[m.id]
-      if (!cb) return
-      delete root.cdpPending[m.id]
-      delete root.cdpDeadline[m.id]
-      // Show a plain sentence, never a V8 stack trace (the description is
-      // several lines of "TypeError … at <anonymous>:147"). The raw text goes
-      // to the shell log.
-      if (m.result && m.result.exceptionDetails) {
-        console.warn("nic.youtube-music page error:", JSON.stringify(m.result.exceptionDetails.exception || m.result.exceptionDetails).slice(0, 2000))
-        cb(null, "The YouTube Music app had a problem with that. Try again.")
-      } else if (m.result && m.result.result) cb(m.result.result.value, "")
-      else if (m.result && !m.error) cb(m.result, "")          // Page.navigate answers {frameId, ...}
-      else {
-        console.warn("nic.youtube-music page error:", JSON.stringify(m.error || m).slice(0, 2000))
-        cb(null, "The YouTube Music page did not answer. Try again.", m.error ? String(m.error.message || "") : "")
+    onConnectionStateChanged: {
+      if (cdpSock.connected) {
+        if (root.cdpQuitPending) { root.cdpQuitPending = false; root.cdpBare("Browser.close", {}, null); return }
+        if (root.cdpQueue.length) root.cdpDiscover()
+        return
       }
+      root.cdpSession = ""
+      root.cdpSessionKind = ""
+      root.cdpAttaching = false
+      root.cdpFail("The YouTube Music page is not reachable.")
+    }
+    // No bridge (the app is not up, or was started some other way).
+    onError: function() {
+      root.cdpAttaching = false
+      root.cdpQuitPending = false
+      root.cdpFail("The YouTube Music page is not reachable.")
+    }
+  }
+  function cdpWrite(cmd) {
+    cdpSock.write(JSON.stringify(cmd) + "\n")
+    cdpSock.flush()
+  }
+  function cdpReceive(message) {
+    var m
+    try { m = JSON.parse(message) } catch (e) { return }
+    if (m.id === undefined) {
+      // Events. The one that matters: the page session went away (the page
+      // crashed or was replaced; a reload keeps it). The next command attaches again.
+      if (m.method === "Target.detachedFromTarget" && m.params && m.params.sessionId === root.cdpSession) {
+        root.cdpSession = ""
+        root.cdpSessionKind = ""
+      }
+      return
+    }
+    var cb = root.cdpPending[m.id]
+    if (!cb) return
+    delete root.cdpPending[m.id]
+    delete root.cdpDeadline[m.id]
+    // Show a plain sentence, never a V8 stack trace (the description is
+    // several lines of "TypeError … at <anonymous>:147"). The raw text goes
+    // to the shell log.
+    if (m.result && m.result.exceptionDetails) {
+      console.warn("nic.youtube-music page error:", JSON.stringify(m.result.exceptionDetails.exception || m.result.exceptionDetails).slice(0, 2000))
+      cb(null, "The YouTube Music app had a problem with that. Try again.")
+    } else if (m.result && m.result.result) cb(m.result.result.value, "")
+    else if (m.result && !m.error) cb(m.result, "")          // Page.navigate and Target.* answer plain objects
+    else {
+      console.warn("nic.youtube-music page error:", JSON.stringify(m.error || m).slice(0, 2000))
+      cb(null, "The YouTube Music page did not answer. Try again.", m.error ? String(m.error.message || "") : "")
     }
   }
   Timer {
@@ -1367,6 +1422,57 @@ Panel {
       for (var i = 0; i < late.length; i++) root.cdpFailOne(late[i], "YouTube Music did not answer. Try again.")
     }
   }
+  // A browser-level command (no session): target lookup, attach, Browser.close.
+  function cdpBare(method, params, cb) {
+    root.cdpId += 1
+    var id = root.cdpId
+    root.cdpPending[id] = cb || function() {}
+    root.cdpDeadline[id] = Date.now() + 20000
+    root.cdpWrite({ id: id, method: method, params: params })
+  }
+  // Find the page and attach to it, then send what queued up meanwhile.
+  function cdpDiscover() {
+    if (root.cdpAttaching || !cdpSock.connected) return
+    root.cdpAttaching = true
+    root.cdpBare("Target.getTargets", {}, function(v) {
+      var list = v && v.targetInfos ? v.targetInfos : []
+      var target = null, offline = null
+      for (var i = 0; i < list.length; i++) {
+        if (list[i].type !== "page") continue
+        if (String(list[i].url).indexOf("music.youtube.com") !== -1) target = list[i]
+        else if (/\/assets\/error\.html$/.test(String(list[i].url))) offline = list[i]
+      }
+      if (target) { root.cdpAttach(target.targetId, "music"); return }
+      if (offline) {
+        root.appOffline = true
+        var keep = root.cdpQueue.filter(function(q) { return q.offlineOk })
+        var drop = root.cdpQueue.filter(function(q) { return !q.offlineOk })
+        root.cdpQueue = keep
+        for (var j = 0; j < drop.length; j++) root.cdpFailOne(drop[j].id, root.offlineText)
+        if (keep.length) { root.cdpAttach(offline.targetId, "offline"); return }
+        root.cdpAttaching = false
+        root.retryAppPage()
+        return
+      }
+      root.cdpAttaching = false
+      root.cdpFail("The app is not showing YouTube Music (still signing in?)")
+    })
+  }
+  function cdpAttach(targetId, kind) {
+    root.cdpBare("Target.attachToTarget", { targetId: targetId, flatten: true }, function(v) {
+      root.cdpAttaching = false
+      if (!v || !v.sessionId) { root.cdpFail("The YouTube Music page is not reachable."); return }
+      root.cdpSession = v.sessionId
+      root.cdpSessionKind = kind
+      var q = root.cdpQueue
+      root.cdpQueue = []
+      for (var i = 0; i < q.length; i++) {
+        if (kind === "offline" && !q[i].offlineOk) { root.cdpFailOne(q[i].id, root.offlineText); continue }
+        q[i].cmd.sessionId = v.sessionId
+        root.cdpWrite(q[i].cmd)
+      }
+    })
+  }
   // Send one CDP command to the YouTube Music page. offlineOk marks the one
   // command that may go to pear's offline page instead (the navigate back).
   function cdpSend(method, params, cb, offlineOk) {
@@ -1374,42 +1480,18 @@ Panel {
     var id = root.cdpId
     root.cdpPending[id] = cb || function() {}
     root.cdpDeadline[id] = Date.now() + 20000
-    var msg = JSON.stringify({ id: id, method: method, params: params })
-    if (cdp.status === WebSocket.Open) { cdp.sendTextMessage(msg); return }
-    root.cdpQueue = root.cdpQueue.concat([{ id: id, msg: msg, offlineOk: !!offlineOk }])
-    if (cdp.status === WebSocket.Connecting || root.cdpLooking) return
-    root.cdpLooking = true
-    var x = new XMLHttpRequest()
-    x.onreadystatechange = function() {
-      if (x.readyState !== XMLHttpRequest.DONE) return
-      root.cdpLooking = false
-      var list = []
-      try { list = JSON.parse(x.responseText) } catch (e) {}
-      var target = null, offline = null
-      for (var i = 0; i < list.length; i++) {
-        if (list[i].type !== "page") continue
-        if (String(list[i].url).indexOf("music.youtube.com") !== -1) target = list[i]
-        else if (/\/assets\/error\.html$/.test(String(list[i].url))) offline = list[i]
-      }
-      if (target) {
-        cdp.url = target.webSocketDebuggerUrl
-        cdp.active = true
-        return
-      }
-      if (offline) {
-        root.appOffline = true
-        var keep = root.cdpQueue.filter(function(q) { return q.offlineOk })
-        var drop = root.cdpQueue.filter(function(q) { return !q.offlineOk })
-        root.cdpQueue = keep
-        for (var j = 0; j < drop.length; j++) root.cdpFailOne(drop[j].id, root.offlineText)
-        if (keep.length) { cdp.url = offline.webSocketDebuggerUrl; cdp.active = true }
-        else root.retryAppPage()
-        return
-      }
-      root.cdpFail("The app is not showing YouTube Music (still signing in?)")
+    var cmd = { id: id, method: method, params: params }
+    if (cdpSock.connected && root.cdpSession !== "" && (root.cdpSessionKind === "music" || offlineOk)) {
+      cmd.sessionId = root.cdpSession
+      root.cdpWrite(cmd)
+      return
     }
-    x.open("GET", root.cdpList)
-    x.send()
+    // Attached to the offline page but this needs YouTube Music: look again,
+    // the page may be back.
+    if (root.cdpSessionKind === "offline" && !offlineOk) { root.cdpSession = ""; root.cdpSessionKind = "" }
+    root.cdpQueue = root.cdpQueue.concat([{ id: id, cmd: cmd, offlineOk: !!offlineOk }])
+    if (!cdpSock.connected) cdpSock.connected = true   // discovery starts once connected
+    else root.cdpDiscover()
   }
   function page(expr, cb, retried) {
     cb = root.pageAnswer(cb, expr, !!retried)
@@ -2350,7 +2432,8 @@ Panel {
   }
 
   property string toastText: ""
-  function toast(t) { toastText = t; toastTimer.restart() }
+  function toast(t) { toastFor(t, 2600) }
+  function toastFor(t, ms) { toastText = t; toastTimer.interval = ms; toastTimer.restart() }
   Timer { id: toastTimer; interval: 2600; onTriggered: root.toastText = "" }
 
   function fmt(sec) {
