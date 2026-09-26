@@ -760,7 +760,8 @@ Panel {
     interval: 15000
     repeat: true
     running: root.appUp && root.isPlaying && root.songReal
-    onTriggered: root.saveLastChecked()
+    // One copy asks the page; every copy used to, once per monitor.
+    onTriggered: if (root.isPrimary()) root.saveLastChecked()
   }
 
   // Quit when idle. Counts only while paused, the panel is closed on every
@@ -2137,6 +2138,8 @@ Panel {
   // line is the sung one), so the other lines do not re-evaluate 20 times a
   // second.
   property real lyricsNow: 0
+  // A seek or pause while the ticker is stopped still lands on the right line.
+  onLyricsAnchorChanged: tickLyrics()
   function tickLyrics() {
     var a = lyricsAnchor
     var t = a.playing ? a.t + (Date.now() - a.at) / 1000 : a.t
@@ -2147,7 +2150,8 @@ Panel {
   }
   Timer {
     interval: 50; repeat: true
-    running: root.lyricsLive && !wordFrames.running
+    // Not while paused: the clock stands still, so the sung line cannot move.
+    running: root.lyricsLive && root.lyricsAnchor.playing && !wordFrames.running
     onTriggered: root.tickLyrics()
   }
   // With word timing the clock runs every frame while music plays, so a word
