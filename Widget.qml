@@ -117,6 +117,29 @@ Panel {
   property var song: null
   property bool isPlaying: false
   property real position: 0
+  // Seconds between the <video>'s own clock and the song's (see Page.js
+  // state()). With gapless playback a song that followed another one showed
+  // at 7:00 of 3:43 and the lyrics ran at the wrong lines. The app's
+  // POSITION_CHANGED reads its progress bar (song time), but its
+  // PLAYER_STATE_CHANGED sends the raw video.currentTime (pear-desktop
+  // renderer, "peard:play-or-paused"), so only that one goes through
+  // songTime(). Subtracting from both froze the seek bar at 0:00.
+  property real timeOffset: 0
+  function songTime(raw) { return Math.max(0, raw - timeOffset) }
+  // The page's clock expression: [song time, paused, gap, videoId].
+  readonly property string clockExpr: "(function(){var v=document.querySelector('video'),p=document.querySelector('#movie_player');if(!v)return null;var t=v.currentTime,id='';try{if(p&&p.getCurrentTime)t=p.getCurrentTime();id=(p.getVideoData()||{}).video_id||''}catch(e){}return [t,v.paused,v.currentTime-t,id]})()"
+  function takeOffset(off, vid) {
+    if (!isFinite(off) || !song || (vid && vid !== song.videoId)) return
+    timeOffset = Math.abs(off) < 0.05 ? 0 : off
+  }
+  // A new song may start at a new gap: read it as soon as the page has it.
+  function readTimeOffset() {
+    if (!appUp) return
+    cdpSend("Runtime.evaluate", { expression: clockExpr, returnByValue: true }, function(v) {
+      if (v && v.length === 4) root.takeOffset(Number(v[2]), String(v[3]))
+    }, false)
+  }
+  Timer { id: offsetTimer; interval: 300; onTriggered: root.readTimeOffset() }
   property int volume: 100
   property bool muted: false
   property string repeatMode: "NONE"   // NONE | ALL | ONE
@@ -1048,8 +1071,12 @@ Panel {
         // which the app sets to false for every newly loaded song, cue or not.
         // Only a song already past 0:00 is taken as really played; the page
         // check 1.5 s later settles the rest.
-        var pi = Number(m.position || 0)
         root.song = m.song || null
+        // Connecting mid-song: the gap is unknown until the page answers,
+        // and the confirm check below corrects the position.
+        root.timeOffset = 0
+        root.readTimeOffset()
+        var pi = Number(m.position || 0)
         root.songReal = pi > 0
         root.isPlaying = root.songReal && !!m.isPlaying
         if (root.songReal || !root.lastSong) root.position = pi
@@ -1093,6 +1120,7 @@ Panel {
         // A real song change is remembered at once (see saveLastChecked for
         // the mislabelled save this also corrects).
         if (root.songReal) root.saveLast()
+        offsetTimer.restart()
         root.fetchLike()
         if (root.opened) queueTimer.restart()
         root.lastPush = now
@@ -1100,7 +1128,7 @@ Panel {
       } else if (m.type === "PLAYER_STATE_CHANGED") {
         // Real play and pause events (only once past 0:00), and the app's
         // own last word when it quits (paused, at the real second).
-        var ps = m.position !== undefined ? Number(m.position) : -1
+        var ps = m.position !== undefined ? root.songTime(Number(m.position)) : -1
         root.stateEpoch += 1
         if (!m.isPlaying) root.pausedAt = now
         if (ps > 0 && !root.incomingSong()) root.songReal = true
@@ -1113,6 +1141,7 @@ Panel {
         if (!root.isPlaying) root.saveLastChecked()
         if (root.lyricsLive) root.syncLyricsClock()
       } else if (m.type === "POSITION_CHANGED") {
+        // Already the song's own time (the app reads its progress bar).
         var p = Number(m.position || 0)
         // Two pushes in a row that move forward by up to 2.5 s within 2.5 s
         // prove the song plays. This is the only sign of a play that started
@@ -1264,6 +1293,7 @@ Panel {
     // and made songReal true, which the cue's late VIDEO_CHANGED then
     // inherited (offline test, 2026-09-24).
     var same = !v || (!!root.song && (!v.videoId || v.videoId === root.song.videoId))
+    if (v && same && v.off !== undefined) root.takeOffset(Number(v.off), v.videoId)
     if (root.pagePlaying(v)) {
       root.isPlaying = true
       if (!same) return
@@ -2077,9 +2107,10 @@ Panel {
   function syncLyricsClock() {
     if (!appUp) return
     var sent = Date.now()
-    cdpSend("Runtime.evaluate", { expression: "(function(){var v=document.querySelector('video');return v?[v.currentTime,v.paused]:null})()",
+    cdpSend("Runtime.evaluate", { expression: root.clockExpr,
       returnByValue: true }, function(v) {
-        if (!v || v.length !== 2) return
+        if (!v || v.length !== 4) return
+        root.takeOffset(Number(v[2]), String(v[3]))
         // The reading is taken from halfway through the round trip. One that
         // agrees with the running clock within 40 ms leaves it alone: taking
         // every reading as it came made the word fill twitch each second by

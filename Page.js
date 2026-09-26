@@ -465,7 +465,13 @@ var SOURCE = String.raw`
       var st = null, vid = "";
       try { st = p && typeof p.getPlayerState === "function" ? p.getPlayerState() : null; } catch (e) {}
       try { vid = p && typeof p.getVideoData === "function" ? ((p.getVideoData() || {}).video_id || "") : ""; } catch (e) {}
-      return { state: typeof st === "number" ? st : null, videoId: vid, t: v ? v.currentTime : 0,
+      // t is the song's own time. With gapless playback the <video> keeps the
+      // songs before this one in the same stream, so its currentTime runs on
+      // from where the last song ended (4:18 into a 3:43 song, seen live);
+      // off is that gap, for correcting the app's pushes (which use it raw).
+      var vt = v ? v.currentTime : 0, t = vt;
+      try { if (p && typeof p.getCurrentTime === "function") t = p.getCurrentTime(); } catch (e) {}
+      return { state: typeof st === "number" ? st : null, videoId: vid, t: t, off: vt - t,
         paused: v ? v.paused : true, ended: v ? v.ended : false };
     },
     // The whole queue in one snapshot, for BOTH the Queue tab and Up next, so
