@@ -18,6 +18,13 @@
 # app rewrites config.json when it quits). An unknown caller then gets 401, or
 # an allow/deny prompt on /auth that defaults to deny.
 #
+# Fails closed: the NONE window lasts only while this script runs. An EXIT
+# trap (errors, Ctrl+C, a closed terminal) quits the app and writes
+# AUTH_AT_FIRST whatever happened, so a failed run leaves the API locked
+# (without a token the widget says so; run this again). Marketplace review
+# omacom/omarchy-plugin-marketplace#8595: the old version exited early on a
+# failure with the API left open.
+#
 # Undo: set authStrategy back to "NONE" in ~/.config/YouTube Music/config.json
 # while the app is closed.
 set -euo pipefail
@@ -37,6 +44,48 @@ app_running() {
 
 up() { curl -fsS -o /dev/null -m 2 "$@" "$api/api/v1/volume" 2>/dev/null; }
 wait_for() { for _ in $(seq 1 "$2"); do eval "$1" && return 0; sleep 0.5; done; return 1; }
+set_strategy() {
+  jq --arg s "$1" '.plugins["api-server"].authStrategy = $s' "$cfg" > "$cfg.tmp" && mv "$cfg.tmp" "$cfg"
+}
+
+# Quit the app: through the widget first, then Browser.close straight to the
+# bridge's socket (in case the shell is down), and SIGKILL only as the last
+# resort. SIGKILL rather than SIGTERM: Chromium crashes on purpose on SIGTERM,
+# and a killed app does not write its in-memory NONE back over config.json.
+quit_app() {
+  app_running || return 0
+  omarchy-shell -q nic.youtube-music quit 2>/dev/null || true
+  wait_for '! app_running' 30 && return 0
+  local sock="${XDG_RUNTIME_DIR:-/run/user/$UID}/nic-youtube-music/cdp.sock"
+  if [[ -S $sock ]]; then
+    python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.settimeout(2); s.connect(sys.argv[1]); s.sendall(b"{\"id\":1,\"method\":\"Browser.close\"}\n")' "$sock" 2>/dev/null || true
+    wait_for '! app_running' 20 && return 0
+  fi
+  local p
+  for p in $(pgrep -f "^$app" || true); do
+    tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -q -- '--type=' || kill -KILL "$p" 2>/dev/null || true
+  done
+  wait_for '! app_running' 10
+}
+
+# Runs on every exit once the API may be open. The app writes its settings back
+# when it quits, so it has to be closed before AUTH_AT_FIRST is written.
+opened=0 locked=0
+lock_on_exit() {
+  local rc=$?
+  trap - EXIT INT TERM HUP
+  if (( opened && ! locked )); then
+    if quit_app; then sleep 1; else echo "YouTube Music would not quit." >&2; fi
+    set_strategy AUTH_AT_FIRST
+    echo "Stopped before finishing: the API is locked again (AUTH_AT_FIRST) but has no working token. Run this again." >&2
+    (( rc )) || rc=1
+  fi
+  exit "$rc"
+}
+trap lock_on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 [[ -f $cfg ]] || { echo "No $cfg: start YouTube Music once and sign in first." >&2; exit 1; }
 strategy=$(jq -r '.plugins["api-server"].authStrategy // "NONE"' "$cfg")
@@ -47,10 +96,12 @@ if [[ $strategy == AUTH_AT_FIRST && -s $tok ]]; then
 fi
 
 # 1. The app must be running with auth NONE to mint a token without a prompt.
-if [[ $strategy != NONE ]]; then
-  if app_running; then echo "Quit YouTube Music first: omarchy-shell nic.youtube-music quit" >&2; exit 1; fi
-  jq '.plugins["api-server"].authStrategy = "NONE"' "$cfg" > "$cfg.tmp" && mv "$cfg.tmp" "$cfg"
+# From here on the API may answer anyone, so the exit trap takes over.
+if [[ $strategy != NONE ]] && app_running; then
+  echo "Quit YouTube Music first: omarchy-shell nic.youtube-music quit" >&2; exit 1
 fi
+opened=1
+[[ $strategy == NONE ]] || set_strategy NONE
 if ! up; then
   omarchy-shell -q nic.youtube-music wake
   wait_for up 60 || { echo "YouTube Music's API did not come up." >&2; exit 1; }
@@ -66,8 +117,8 @@ up -H "Authorization: Bearer $token" || { echo "The new token does not work." >&
 
 # 3. Quit the app cleanly (Browser.close through the bridge, never a kill:
 # Chromium crashes on purpose on SIGTERM), then switch to AUTH_AT_FIRST.
-omarchy-shell -q nic.youtube-music quit
-wait_for '! app_running' 40 || { echo "YouTube Music did not quit; switch authStrategy by hand once it has." >&2; exit 1; }
+quit_app || { echo "YouTube Music did not quit." >&2; exit 1; }
 sleep 1
-jq '.plugins["api-server"].authStrategy = "AUTH_AT_FIRST"' "$cfg" > "$cfg.tmp" && mv "$cfg.tmp" "$cfg"
+set_strategy AUTH_AT_FIRST
+locked=1
 echo "Locked: authStrategy AUTH_AT_FIRST, token in $tok. The widget starts the app again when needed."
