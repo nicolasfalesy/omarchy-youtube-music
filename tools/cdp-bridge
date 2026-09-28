@@ -26,6 +26,7 @@ Started by the widget when the app is needed, and by the app's menu entry
 (tools/setup installs one), so the app is never started with an open port.
 """
 
+import json
 import os
 import select
 import signal
@@ -39,6 +40,7 @@ APP = os.environ.get("NIC_YTM_APP", "/opt/YouTube Music/youtube-music")
 FLAGS_FILE = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
                           "youtube-music-flags.conf")
 MAX_PENDING = 256 * 1024 * 1024  # bytes without a separator before a peer is dropped
+MAX_CLIENTS = 8  # one per monitor copy of the widget, plus a quit from lock-api
 
 
 def die(msg, code=1):
@@ -142,29 +144,41 @@ def main():
     signal.signal(signal.SIGINT, lambda *_: stopping.append(1))
     signal.signal(signal.SIGPIPE, signal.SIG_IGN)
 
-    client = None
+    # Every connection is served at once. One copy of the widget runs per
+    # monitor and each opens its own connection; when only the newest was
+    # kept, the copies kicked each other off while the app started (each
+    # polls the page for readiness), and the clicked copy's library load
+    # failed with "not reachable" until the panel was reopened (2026-09-28).
+    # Command ids are renumbered here so each answer goes back to the
+    # connection that asked (every copy counts its ids from 1); events carry
+    # no id and go to every connection.
+    clients = {}  # socket -> bytes received without a newline yet
+    routes = {}   # bridge id -> (socket, the id that connection used)
+    next_id = 0
     from_app = b""
-    from_client = b""
+
+    def drop(conn):
+        clients.pop(conn, None)
+        for rid in [rid for rid, (c, _) in routes.items() if c is conn]:
+            del routes[rid]
+        conn.close()
+
     try:
         while not stopping:
             done, _status = os.waitpid(pid, os.WNOHANG)
             if done:
                 break
-            watch = [server, from_app_r] + ([client] if client else [])
+            watch = [server, from_app_r] + list(clients)
             try:
                 ready, _, _ = select.select(watch, [], [], 1.0)
             except InterruptedError:
                 continue
             if server in ready:
                 conn, _ = server.accept()
-                if peer_uid(conn) != os.getuid():
+                if peer_uid(conn) != os.getuid() or len(clients) >= MAX_CLIENTS:
                     conn.close()
                 else:
-                    # The newest connection wins: a reloaded widget replaces
-                    # the old one rather than queueing behind it.
-                    if client:
-                        client.close()
-                    client, from_client = conn, b""
+                    clients[conn] = b""
             if from_app_r in ready:
                 chunk = os.read(from_app_r, 1 << 20)
                 if not chunk:
@@ -173,37 +187,59 @@ def main():
                 *messages, from_app = from_app.split(b"\0")
                 if len(from_app) > MAX_PENDING:
                     from_app = b""
-                if client and messages:
+                out = {}  # socket -> lines to send
+                for raw in messages:
                     try:
-                        client.sendall(b"".join(m + b"\n" for m in messages))
+                        msg = json.loads(raw)
+                    except ValueError:
+                        continue
+                    if isinstance(msg, dict) and "id" in msg:
+                        route = routes.pop(msg["id"], None)
+                        if not route or route[0] not in clients:
+                            continue
+                        msg["id"] = route[1]
+                        out.setdefault(route[0], []).append(json.dumps(msg, separators=(",", ":")).encode())
+                    else:
+                        for conn in clients:
+                            out.setdefault(conn, []).append(raw)
+                for conn, lines in out.items():
+                    try:
+                        conn.sendall(b"".join(line + b"\n" for line in lines))
                     except OSError:
-                        client.close()
-                        client = None
-            if client and client in ready:
+                        drop(conn)
+            for conn in [c for c in ready if c in clients]:
                 try:
-                    chunk = client.recv(1 << 20)
+                    chunk = conn.recv(1 << 20)
                 except OSError:
                     chunk = b""
                 if not chunk:
-                    client.close()
-                    client = None
+                    drop(conn)
                     continue
-                from_client += chunk
-                *lines, from_client = from_client.split(b"\n")
-                if len(from_client) > MAX_PENDING:
-                    client.close()
-                    client, from_client = None, b""
+                *lines, rest = (clients[conn] + chunk).split(b"\n")
+                if len(rest) > MAX_PENDING:
+                    drop(conn)
+                    continue
+                clients[conn] = rest
                 for line in lines:
-                    if line.strip():
-                        os.write(to_app_w, line + b"\0")
+                    try:
+                        msg = json.loads(line)
+                    except ValueError:
+                        continue
+                    if not isinstance(msg, dict):
+                        continue
+                    if "id" in msg:
+                        next_id += 1
+                        routes[next_id] = (conn, msg["id"])
+                        msg["id"] = next_id
+                    os.write(to_app_w, json.dumps(msg, separators=(",", ":")).encode() + b"\0")
     finally:
         try:
             os.unlink(path)
         except OSError:
             pass
         server.close()
-        if client:
-            client.close()
+        for conn in list(clients):
+            conn.close()
         os.close(to_app_w)
         os.close(from_app_r)
     # Reap the app when it exits so it never lingers as a zombie.
