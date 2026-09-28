@@ -30,6 +30,22 @@ apps="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
 entry="$apps/com.github.th-ch.youtube-music.desktop"
 
 say() { printf '%s\n' "$*"; }
+# Replaces the file $1 with what "$3..." prints, through a new temp file in
+# the same folder. mktemp creates it exclusively with mode 600, so a symlink
+# planted at a guessable name (the old "$file.tmp") is never followed and
+# nothing else gets truncated; mv then renames over the entry itself. $2 is
+# the final mode. On any failure the temp file goes and the target is left
+# as it was (marketplace review omacom/omarchy-plugin-marketplace#8595,
+# 2026-09-28).
+replace_with() {
+  local target=$1 mode=$2 tmp
+  shift 2
+  tmp=$(mktemp -- "$(dirname -- "$target")/.$(basename -- "$target").XXXXXXXX") || return 1
+  if "$@" > "$tmp" && chmod "$mode" -- "$tmp" && mv -f -- "$tmp" "$target"; then return 0; fi
+  rm -f -- "$tmp"
+  return 1
+}
+strip_debug_flags() { grep -v -- '--remote-debugging-' "$flags" || true; }
 app_running() {
   local p
   for p in $(pgrep -f "^$app" || true); do
@@ -55,21 +71,20 @@ fi
 
 # 2. No debug port.
 if [[ -f $flags ]] && grep -q -- '--remote-debugging-' "$flags"; then
-  cp -- "$flags" "$flags.bak.$(date +%s)"
-  grep -v -- '--remote-debugging-' "$flags" > "$flags.tmp" || true
-  mv -- "$flags.tmp" "$flags"
+  # The backup's name comes from mktemp too (created exclusively, mode 600).
+  bak=$(mktemp -- "$flags.bak.XXXXXXXX") && cat -- "$flags" > "$bak"
+  replace_with "$flags" 600 strip_debug_flags
   say "Removed the debug-port lines from $flags (a backup is next to it)."
 fi
 
 # 4. and the API server's place. authStrategy is left to lock-api: it has to
 # be NONE for the one moment it takes to mint the token.
-jq '.plugins["api-server"] = ((.plugins["api-server"] // {}) + {enabled: true, hostname: "127.0.0.1", port: 26538, useHttps: false})
-    | .options.resumeOnStart = false | .options.tray = false | .options.startAtLogin = false' \
-  "$cfg" > "$cfg.tmp" && mv -- "$cfg.tmp" "$cfg"
+replace_with "$cfg" 600 jq '.plugins["api-server"] = ((.plugins["api-server"] // {}) + {enabled: true, hostname: "127.0.0.1", port: 26538, useHttps: false})
+    | .options.resumeOnStart = false | .options.tray = false | .options.startAtLogin = false' "$cfg"
 
 # 3. The menu entry. A user entry with the same name hides the packaged one.
 mkdir -p -- "$apps"
-cat > "$entry.tmp" <<EOF
+replace_with "$entry" 644 cat <<EOF
 [Desktop Entry]
 Name=YouTube Music
 Comment=YouTube Music, started for the nic.youtube-music bar widget (private debugging pipe, no port)
@@ -80,7 +95,6 @@ Icon=youtube-music
 StartupWMClass=com.github.th-ch.youtube-music
 Categories=AudioVideo;
 EOF
-mv -- "$entry.tmp" "$entry"
 say "Menu entry: $entry"
 
 # 1. Lock the API (mints the token while the app briefly runs with NONE).
