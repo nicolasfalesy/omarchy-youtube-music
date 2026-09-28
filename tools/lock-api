@@ -25,8 +25,8 @@
 # omacom/omarchy-plugin-marketplace#8595: the old version exited early on a
 # failure with the API left open.
 #
-# "Locked" is only reported once the app is gone and nothing on the port
-# answers without a token. Writing config.json alone does not lock anything:
+# "Locked" is only reported once AUTH_AT_FIRST is read back from config.json,
+# the app is gone, and nothing on the port answers without a token. Writing config.json alone does not lock anything:
 # a still-running app keeps NONE in memory, answers anyone, and writes NONE
 # back over config.json when it finally quits (same review, 2026-09-27). If
 # the app will not quit, the script says the API is still open, names the
@@ -52,8 +52,11 @@ app_running() { [[ -n $(app_pids) ]]; }
 up() { curl -fsS -o /dev/null -m 2 "$@" "$api/api/v1/volume" 2>/dev/null; }
 wait_for() { for _ in $(seq 1 "$2"); do eval "$1" && return 0; sleep 0.5; done; return 1; }
 set_strategy() {
-  jq --arg s "$1" '.plugins["api-server"].authStrategy = $s' "$cfg" > "$cfg.tmp" && mv "$cfg.tmp" "$cfg"
+  jq --arg s "$1" '.plugins["api-server"].authStrategy = $s' "$cfg" > "$cfg.tmp" && mv "$cfg.tmp" "$cfg" \
+    || { rm -f "$cfg.tmp"; return 1; }
 }
+# What config.json says now, read back rather than assumed from a write.
+strategy_is() { [[ $(jq -r '.plugins["api-server"].authStrategy // "NONE"' "$cfg" 2>/dev/null) == "$1" ]]; }
 
 # Quit the app: through the widget first, then Browser.close straight to the
 # bridge's socket (in case the shell is down), and SIGKILL only as the last
@@ -79,7 +82,14 @@ quit_app() {
 close_api() {
   local quit=0
   if quit_app; then quit=1; sleep 1; fi
-  set_strategy AUTH_AT_FIRST
+  # Checked explicitly: close_api runs under `if !`, where set -e is off, so a
+  # failed write would otherwise fall through to "Locked" and leave NONE for
+  # the next launch (review #8595, 2026-09-28).
+  if ! set_strategy AUTH_AT_FIRST || ! strategy_is AUTH_AT_FIRST; then
+    echo "NOT LOCKED: could not write authStrategy AUTH_AT_FIRST to $cfg, so the app's next start would answer anyone." >&2
+    echo "Check the file can be written (disk space, permissions), then run this again." >&2
+    return 1
+  fi
   (( quit )) && ! up && return 0
   echo "NOT LOCKED: YouTube Music would not quit, so its API still answers without a token." >&2
   echo "It will also write NONE back into config.json when it exits. Close it, then run this again:" >&2
