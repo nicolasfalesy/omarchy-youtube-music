@@ -64,7 +64,9 @@ hidden in the background, starts when you need it, and quits when you don't.
    any old `--remote-debugging-port` line from `~/.config/youtube-music-flags.conf`, and turns
    off the app's `resumeOnStart`, tray and start-at-login (the widget does the resuming, and
    quits the app when idle). If the app's API ever answers without the token again, the panel
-   says so.
+   says so. Setup only reports the API locked after checking that the app has quit and nothing
+   answers without the token; if the app will not quit, it says the API is still open, names
+   the process to close, and stops with an error (run it again after closing the app).
 
 ### How the widget reaches the app, and why no port is open
 

@@ -25,6 +25,13 @@
 # omacom/omarchy-plugin-marketplace#8595: the old version exited early on a
 # failure with the API left open.
 #
+# "Locked" is only reported once the app is gone and nothing on the port
+# answers without a token. Writing config.json alone does not lock anything:
+# a still-running app keeps NONE in memory, answers anyone, and writes NONE
+# back over config.json when it finally quits (same review, 2026-09-27). If
+# the app will not quit, the script says the API is still open, names the
+# process, and exits 1; running it again picks up from that state.
+#
 # Undo: set authStrategy back to "NONE" in ~/.config/YouTube Music/config.json
 # while the app is closed.
 set -euo pipefail
@@ -34,13 +41,13 @@ api=http://127.0.0.1:26538
 app="/opt/YouTube Music/youtube-music"
 # The app's main process: the one without --type= (the rest are its helpers).
 # Its flags differ by how it was started, so match the path alone.
-app_running() {
+app_pids() {
   local p
   for p in $(pgrep -f "^$app" || true); do
-    tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -q -- '--type=' || return 0
+    tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -q -- '--type=' || echo "$p"
   done
-  return 1
 }
+app_running() { [[ -n $(app_pids) ]]; }
 
 up() { curl -fsS -o /dev/null -m 2 "$@" "$api/api/v1/volume" 2>/dev/null; }
 wait_for() { for _ in $(seq 1 "$2"); do eval "$1" && return 0; sleep 0.5; done; return 1; }
@@ -62,23 +69,39 @@ quit_app() {
     wait_for '! app_running' 20 && return 0
   fi
   local p
-  for p in $(pgrep -f "^$app" || true); do
-    tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -q -- '--type=' || kill -KILL "$p" 2>/dev/null || true
-  done
+  for p in $(app_pids); do kill -KILL "$p" 2>/dev/null || true; done
   wait_for '! app_running' 10
 }
 
-# Runs on every exit once the API may be open. The app writes its settings back
-# when it quits, so it has to be closed before AUTH_AT_FIRST is written.
-opened=0 locked=0
+# Quits the app, writes AUTH_AT_FIRST, then checks the result. The app writes
+# its settings back when it quits, so it has to be closed before AUTH_AT_FIRST
+# is written; if it is still running, its in-memory NONE is still live.
+close_api() {
+  local quit=0
+  if quit_app; then quit=1; sleep 1; fi
+  set_strategy AUTH_AT_FIRST
+  (( quit )) && ! up && return 0
+  echo "NOT LOCKED: YouTube Music would not quit, so its API still answers without a token." >&2
+  echo "It will also write NONE back into config.json when it exits. Close it, then run this again:" >&2
+  echo "  kill -KILL $(app_pids | tr '\n' ' ')" >&2
+  return 1
+}
+
+# Runs on every exit once the API may be open, including the normal one: the
+# lock and the "Locked" message both come from here, after close_api checked.
+opened=0 minted=0
 lock_on_exit() {
   local rc=$?
   trap - EXIT INT TERM HUP
-  if (( opened && ! locked )); then
-    if quit_app; then sleep 1; else echo "YouTube Music would not quit." >&2; fi
-    set_strategy AUTH_AT_FIRST
-    echo "Stopped before finishing: the API is locked again (AUTH_AT_FIRST) but has no working token. Run this again." >&2
-    (( rc )) || rc=1
+  if (( opened )); then
+    if ! close_api; then
+      rc=1
+    elif (( minted )); then
+      echo "Locked: authStrategy AUTH_AT_FIRST, token in $tok. The widget starts the app again when needed."
+    else
+      echo "Stopped before finishing: the API is locked again (AUTH_AT_FIRST) but has no working token. Run this again." >&2
+      (( rc )) || rc=1
+    fi
   fi
   exit "$rc"
 }
@@ -90,14 +113,19 @@ trap 'exit 129' HUP
 [[ -f $cfg ]] || { echo "No $cfg: start YouTube Music once and sign in first." >&2; exit 1; }
 strategy=$(jq -r '.plugins["api-server"].authStrategy // "NONE"' "$cfg")
 
-if [[ $strategy == AUTH_AT_FIRST && -s $tok ]]; then
+# "Already locked" needs the API to refuse a caller without a token too: after
+# a run where the app would not quit, config.json says AUTH_AT_FIRST and the
+# token exists, but the running app still answers anyone.
+if [[ $strategy == AUTH_AT_FIRST && -s $tok ]] && ! up; then
   echo "Already locked (AUTH_AT_FIRST, token present)."
   exit 0
 fi
 
 # 1. The app must be running with auth NONE to mint a token without a prompt.
-# From here on the API may answer anyone, so the exit trap takes over.
-if [[ $strategy != NONE ]] && app_running; then
+# From here on the API may answer anyone, so the exit trap takes over. An app
+# that already answers without a token is open whatever config.json says, so
+# go on and lock it rather than asking for a quit it may refuse again.
+if [[ $strategy != NONE ]] && app_running && ! up; then
   echo "Quit YouTube Music first: omarchy-shell nic.youtube-music quit" >&2; exit 1
 fi
 opened=1
@@ -115,10 +143,8 @@ mkdir -p "${tok%/*}"
 ( umask 077; printf '%s\n' "$token" > "$tok.tmp" ) && mv "$tok.tmp" "$tok"
 up -H "Authorization: Bearer $token" || { echo "The new token does not work." >&2; exit 1; }
 
-# 3. Quit the app cleanly (Browser.close through the bridge, never a kill:
-# Chromium crashes on purpose on SIGTERM), then switch to AUTH_AT_FIRST.
-quit_app || { echo "YouTube Music did not quit." >&2; exit 1; }
-sleep 1
-set_strategy AUTH_AT_FIRST
-locked=1
-echo "Locked: authStrategy AUTH_AT_FIRST, token in $tok. The widget starts the app again when needed."
+minted=1
+
+# 3. Nothing left to do here: the exit trap quits the app (Browser.close
+# through the bridge first; Chromium crashes on purpose on SIGTERM), writes
+# AUTH_AT_FIRST, and only then says "Locked", once it has checked.
