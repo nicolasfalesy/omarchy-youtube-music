@@ -1620,7 +1620,7 @@ Panel {
   property var lyricsCache: ({})
   property int lyricsSerial: 0
   property int lyricIndex: -1
-  property var lyricsXhrs: []
+  property var lyricsFetches: []
   readonly property string lyricsKey: hasSong && shownSong.videoId ? String(shownSong.videoId) : ""
   onLyricsKeyChanged: if (opened && view === "lyrics" && !searching && !currentPage) loadLyrics()
 
@@ -2046,30 +2046,52 @@ Panel {
     }
     return total ? done / total : 1
   }
-  function lyricsGet(url, cb) {
-    var x = new XMLHttpRequest()
-    root.lyricsXhrs = root.lyricsXhrs.concat([x])
-    x.onreadystatechange = function() {
-      if (x.readyState !== XMLHttpRequest.DONE) return
-      root.lyricsXhrs = root.lyricsXhrs.filter(function(o) { return o !== x })
-      if (!root.lyricsXhrs.length) lyricsTimeout.stop()
-      var d = null
-      if (x.status === 200) { try { d = JSON.parse(x.responseText) } catch (e) {} }
-      cb(d)
+  // Lyrics come from the internet (LRCLIB, KuGou), so curl fetches them
+  // instead of QML's XMLHttpRequest, which buffered the whole answer inside
+  // the shell with no size limit: a huge or endless answer could exhaust or
+  // stall it before the 8 s timer. --max-filesize stops the transfer at the
+  // cap even when the size is not announced (chunked; checked with curl
+  // 8.22), and a failed or capped fetch hands the shell nothing, so it never
+  // holds or parses more than lyricsMaxBytes of untrusted data (marketplace
+  // review omacom/omarchy-plugin-marketplace#8595, 2026-09-28). Real answers
+  // are 5 KiB (KuGou) to ~120 KiB (an LRCLIB search).
+  readonly property int lyricsMaxBytes: 2 * 1024 * 1024
+  Component {
+    id: lyricsFetch
+    Process {
+      id: fetchProc
+      property var done: null
+      stdout: StdioCollector { id: fetchOut; waitForEnd: true }
+      onExited: function(exitCode) { root.lyricsFetched(fetchProc, exitCode === 0 ? fetchOut.text : "") }
     }
-    x.open("GET", url)
+  }
+  function lyricsGet(url, cb) {
+    var cmd = ["curl", "-fsS", "--proto", "=https", "--max-time", "8", "--max-filesize", String(root.lyricsMaxBytes)]
     // LRCLIB asks clients to name themselves.
     if (url.indexOf("https://lrclib.net/") === 0)
-      x.setRequestHeader("Lrclib-Client", "nic.youtube-music (Omarchy bar widget)")
-    x.send()
+      cmd = cmd.concat(["-H", "Lrclib-Client: nic.youtube-music (Omarchy bar widget)"])
+    var p = lyricsFetch.createObject(root, { command: cmd.concat(["--", url]), done: cb })
+    root.lyricsFetches = root.lyricsFetches.concat([p])
+    p.running = true
     lyricsTimeout.restart()
+  }
+  function lyricsFetched(p, text) {
+    root.lyricsFetches = root.lyricsFetches.filter(function(o) { return o !== p })
+    if (!root.lyricsFetches.length) lyricsTimeout.stop()
+    var d = null
+    if (text) { try { d = JSON.parse(text) } catch (e) {} }
+    var cb = p.done
+    p.done = null
+    // Not destroyed from inside its own exited handler.
+    Qt.callLater(function() { p.destroy() })
+    if (cb) cb(d)
   }
   // A lookup that hangs (a dead connection after a network change, see
   // ArtImage) is given up 8 s after the last one started, and the next
   // source is used.
   Timer {
     id: lyricsTimeout; interval: 8000
-    onTriggered: { var xs = root.lyricsXhrs; for (var i = 0; i < xs.length; i++) xs[i].abort() }
+    onTriggered: { var ps = root.lyricsFetches; for (var i = 0; i < ps.length; i++) ps[i].running = false }
   }
   function lrclibLookup(ss, cb) {
     var q = function(k, v) { return k + "=" + encodeURIComponent(v) }
