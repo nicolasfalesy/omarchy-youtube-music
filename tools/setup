@@ -18,8 +18,11 @@
 #   4. resumeOnStart, tray and startAtLogin off: the widget does the resuming,
 #      and the app quits when idle.
 #
-# Run it with the app signed in once (start it from the launcher, sign in,
-# quit it). Undo: see "Remove" in README.md.
+# The widget's panel runs this on its "Set up" button (the user's consent);
+# it also works from a terminal. On a first run the app has no settings file
+# yet, so this starts it once through the bridge to create one. Signing in
+# can happen afterwards, in the app window (the widget shows it). Undo: see
+# "Remove" in README.md.
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -55,10 +58,26 @@ app_running() {
 }
 
 [[ -x $app ]] || { say "YouTube Music (pear-desktop) is not installed. Install it first:  yay -S pear-desktop-bin" >&2; exit 1; }
-[[ -s $cfg ]] || { say "Start YouTube Music once from the launcher and sign in, quit it, then run this again." >&2; exit 1; }
 for tool in jq curl openssl python3; do
   command -v "$tool" >/dev/null || { say "Missing $tool." >&2; exit 1; }
 done
+
+# 0. A first run: the app writes config.json when it starts, so start it once
+# (through the bridge, so never with a debug port) and wait for the file. The
+# quit below then closes it before anything is changed.
+if [[ ! -s $cfg ]]; then
+  say "Starting YouTube Music once so it creates its settings..."
+  app_running || setsid -f "$here/cdp-bridge" >/dev/null 2>&1
+  for _ in $(seq 1 120); do [[ -s $cfg ]] && break; sleep 0.5; done
+  if [[ ! -s $cfg ]]; then
+    # Not left running behind a failed setup.
+    omarchy-shell -q nic.youtube-music quit || true
+    say "YouTube Music didn't create its settings. Start it once from the app launcher, then try again." >&2
+    exit 1
+  fi
+  # Let it finish its first write before it is asked to quit.
+  sleep 3
+fi
 
 # The app rewrites config.json when it quits, so edits happen with it closed.
 if app_running; then
@@ -100,4 +119,4 @@ say "Menu entry: $entry"
 # 1. Lock the API (mints the token while the app briefly runs with NONE).
 "$here/lock-api"
 
-say "Done. Also add the window rule from README.md step 3 if you have not yet."
+say "Done."

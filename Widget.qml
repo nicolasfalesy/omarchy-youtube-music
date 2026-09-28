@@ -350,6 +350,7 @@ Panel {
   function open() {
     controller.show()
     readAppShown()
+    checkInstalled()
     if (view === "queue") queueScrollToNow = true
     if (view === "lyrics" && !searching) loadLyrics()
     if (appUp) refresh()
@@ -405,18 +406,21 @@ Panel {
   // in the plugin folder (a write there reloads the plugin) and never in the
   // backup.
   property string apiToken: ""
+  // Set once the token file has been read (or found missing), so the setup
+  // screen never flashes before the file loads.
+  property bool tokenChecked: false
   // The file loads asynchronously, after the first probe has already gone out
   // without it. Under auth that probe is refused (the app accepts the socket,
   // then closes it with 1008), so a token that arrives while the app is not up
   // probes again at once instead of at the next 20 s tick.
-  onApiTokenChanged: if (!appUp) probe()
+  onApiTokenChanged: { if (!appUp) probe(); wakeIfSetUp() }
   FileView {
     id: tokenFile
     path: root.stateDir + "/token"
     watchChanges: true
     printErrors: false
-    onLoaded: root.apiToken = text().trim()
-    onLoadFailed: root.apiToken = ""
+    onLoaded: { root.apiToken = text().trim(); root.tokenChecked = true }
+    onLoadFailed: { root.apiToken = ""; root.tokenChecked = true }
     onFileChanged: reload()
   }
 
@@ -556,6 +560,14 @@ Panel {
   // Start the app in the background if it is not running. action "play"
   // resumes the remembered song once the page is ready.
   function wake(action) {
+    // Not installed or not set up: nothing to start yet. The panel says what
+    // to do; a play from the bar says so in a toast. Setup itself wakes the
+    // app through here to mint its token, so it is let through.
+    if (!setupRunning && !appUp && (!appInstalled || needsSetup)) {
+      if (action === "play") toastFor(appInstalled ? "YouTube Music isn't set up yet. Open the panel to set it up."
+        : "YouTube Music isn't installed yet. Open the panel to install it.", 5000)
+      return
+    }
     if (action === "play") pendingAction = "play"
     if (appUp) { if (pendingAction) whenReady(doPending); return }
     if (starting) return
@@ -813,6 +825,7 @@ Panel {
       // instead of at the next 20 s probe. openwindow is
       // "ADDRESS,WORKSPACE,CLASS,TITLE"; the title may hold commas, the class not.
       else if (event.name === "activewindow") root.activeClass = String(event.data).split(",")[0]
+      else if (event.name === "configreloaded" && root.isPrimary()) root.ensureWindowRule()
       else if (event.name === "openwindow" && !root.appUp && String(event.data).split(",")[2] === root.appClass)
         root.probeSoon()
     }
@@ -1396,31 +1409,52 @@ Panel {
   property bool cdpAttaching: false
   property bool cdpQuitPending: false
 
-  Socket {
-    id: cdpSock
-    path: root.cdpSockPath
-    connected: false
-    parser: SplitParser {
-      splitMarker: "\n"
-      onRead: function(line) { root.cdpReceive(line) }
-    }
-    onConnectionStateChanged: {
-      if (cdpSock.connected) {
-        if (root.cdpQuitPending) { root.cdpQuitPending = false; root.cdpBare("Browser.close", {}, null); return }
-        if (root.cdpQueue.length) root.cdpDiscover()
-        return
+  // The socket is rebuilt after every connection error. Quickshell's Socket
+  // (0.3) never connects again once a connect has failed (no bridge yet, or
+  // the app mid-restart): it reads connected=false, but setting it true again,
+  // false then true, a next-tick true or a new path all do nothing, so every
+  // later command waited out its 20 s and the panel said "did not answer"
+  // until the shell restarted. Only a fresh Socket object connects (standalone
+  // test, 2026-09-28). Seen in the first-run setup, which restarts the app
+  // three times, but any command sent while the bridge is down hit it.
+  Component {
+    id: cdpSockComp
+    Socket {
+      id: sock
+      path: root.cdpSockPath
+      connected: false
+      parser: SplitParser {
+        splitMarker: "\n"
+        onRead: function(line) { if (sock === root.cdpSock) root.cdpReceive(line) }
       }
-      root.cdpSession = ""
-      root.cdpSessionKind = ""
-      root.cdpAttaching = false
-      root.cdpFail("The YouTube Music page is not reachable.")
+      onConnectionStateChanged: {
+        if (sock !== root.cdpSock) return
+        if (sock.connected) {
+          if (root.cdpQuitPending) { root.cdpQuitPending = false; root.cdpBare("Browser.close", {}, null); return }
+          if (root.cdpQueue.length) root.cdpDiscover()
+          return
+        }
+        root.cdpSession = ""
+        root.cdpSessionKind = ""
+        root.cdpAttaching = false
+        root.cdpFail("The YouTube Music page is not reachable.")
+      }
+      // No bridge (the app is not up, or was started some other way).
+      onError: function() {
+        if (sock !== root.cdpSock) return
+        root.cdpAttaching = false
+        root.cdpQuitPending = false
+        root.cdpFail("The YouTube Music page is not reachable.")
+        Qt.callLater(root.newCdpSock)
+      }
     }
-    // No bridge (the app is not up, or was started some other way).
-    onError: function() {
-      root.cdpAttaching = false
-      root.cdpQuitPending = false
-      root.cdpFail("The YouTube Music page is not reachable.")
-    }
+  }
+  property var cdpSock: cdpSockComp.createObject(root)
+  function newCdpSock() {
+    var old = cdpSock
+    cdpSock = cdpSockComp.createObject(root)
+    // Not destroyed inside its own error handler.
+    if (old) Qt.callLater(function() { old.destroy() })
   }
   function cdpWrite(cmd) {
     cdpSock.write(JSON.stringify(cmd) + "\n")
@@ -2504,6 +2538,100 @@ Panel {
     wake("")
   }
 
+  // ------------------------------------------------------------ first run
+  // Everything the README used to ask for by hand, done from the panel so the
+  // plugin works after a plain `omarchy plugin add` (marketplace "manual
+  // setup" label, 2026-09-28). Three steps, each only on the user's click or
+  // needing no change to their files:
+  // 1. The app: when it is not installed the panel offers an Install button,
+  //    which opens Omarchy's floating terminal running a plain interactive
+  //    `yay -S --needed pear-desktop-bin`: yay shows its own prompts and the
+  //    user confirms (or stops) the install there. Not omarchy-pkg-aur-add,
+  //    which passes --noconfirm.
+  // 2. tools/setup: when there is no token yet the panel explains what setup
+  //    changes and runs it only on "Set up". It creates the app's settings on
+  //    a first run, locks the API and adds the menu entry.
+  // 3. The window rule: added at runtime with `hyprctl eval`, no file edited.
+  //    It is named, so each shell start replaces it instead of adding another
+  //    copy (same-name rules replace each other, checked on Hyprland 0.56),
+  //    and it is added again after a config reload, which drops runtime
+  //    rules. A matching rule in hyprland.lua does no harm.
+  readonly property string appPath: "/opt/YouTube Music/youtube-music"
+  // Assumed installed until checked, so a normal start never flashes the
+  // install screen.
+  property bool appInstalled: true
+  property bool setupRunning: false
+  property string setupError: ""
+  readonly property bool needsSetup: appInstalled && tokenChecked && apiToken === "" && !appUp
+  readonly property bool setupScreen: !appInstalled || needsSetup || setupRunning
+  function checkInstalled() { if (!installCheck.running) installCheck.running = true }
+  Process {
+    id: installCheck
+    command: ["test", "-x", root.appPath]
+    onExited: function(exitCode) { root.appInstalled = exitCode === 0 }
+  }
+  // While the install screen shows, look again every 2 s, so it moves on by
+  // itself once the install terminal finishes.
+  Timer { interval: 2000; repeat: true; running: root.opened && !root.appInstalled; onTriggered: root.checkInstalled() }
+  function installApp() {
+    Quickshell.execDetached(["omarchy-launch-floating-terminal-with-presentation",
+      "echo 'Installing YouTube Music (pear-desktop-bin from the AUR). yay asks you to confirm.'; yay -S --needed pear-desktop-bin"])
+  }
+  // Every copy has to know: tools/setup wakes and quits the app through this
+  // widget's IPC, which only one copy answers, and wake() refuses to start an
+  // app that is not set up unless setup is what asked.
+  function setSetupRunning(v) {
+    var ps = peers()
+    for (var i = 0; i < ps.length; i++) if (ps[i] && ps[i] !== root) ps[i].setupRunning = v
+    setupRunning = v
+  }
+  function runSetup() {
+    if (setupRunning) return
+    setupError = ""
+    setSetupRunning(true)
+    setupProc.running = true
+  }
+  Process {
+    id: setupProc
+    command: ["bash", root.pluginDir + "/tools/setup"]
+    stdout: StdioCollector { id: setupOut; waitForEnd: true }
+    stderr: StdioCollector { id: setupErr; waitForEnd: true }
+    onExited: function(exitCode) {
+      root.setSetupRunning(false)
+      tokenFile.reload()
+      if (exitCode === 0) {
+        root.setupError = ""
+        root.toastFor("YouTube Music is set up. Sign in inside the app if it asks.", 5000)
+        // Straight on to the app, rather than a "closed" screen with a Start
+        // button the user just effectively pressed. Only once the new token
+        // has loaded (the reload above is asynchronous), or wake() would
+        // still see "not set up".
+        root.wakeAfterSetup = true
+        if (root.apiToken !== "") root.wakeIfSetUp()
+        return
+      }
+      // What it said on stderr is the reason, a sentence or two (lock-api
+      // names the failure, then says the API was locked again). Its last
+      // stdout line stands in when stderr is empty.
+      var clean = function(t) { return String(t).split("\n").map(function(l) { return l.trim() }).filter(function(l) { return l !== "" }) }
+      var errLines = clean(setupErr.text), outLines = clean(setupOut.text)
+      root.setupError = errLines.length ? errLines.slice(-3).join(" ")
+        : (outLines.length ? outLines[outLines.length - 1] : "Setup stopped with an error.")
+    }
+  }
+  property bool wakeAfterSetup: false
+  function wakeIfSetUp() {
+    if (!wakeAfterSetup || apiToken === "") return
+    wakeAfterSetup = false
+    if (opened && !appUp) wake("")
+  }
+  function ensureWindowRule() {
+    Quickshell.execDetached(["hyprctl", "eval",
+      "hl.window_rule({ name = \"nic-youtube-music\", match = { class = \"" + root.appClass + "\" }, workspace = \"special:music silent\" })"])
+  }
+  // After the bar has built every copy, so isPrimary() is settled.
+  Timer { id: firstRunInit; interval: 1500; running: true; onTriggered: { root.checkInstalled(); if (root.isPrimary()) root.ensureWindowRule() } }
+
   property string toastText: ""
   function toast(t) { toastFor(t, 2600) }
   function toastFor(t, ms) { toastText = t; toastTimer.interval = ms; toastTimer.restart() }
@@ -2649,7 +2777,7 @@ Panel {
   // wait before a wake, never while nothing is happening.
   QtObject { id: pulse; property real value: 1 }
   SequentialAnimation {
-    running: root.starting || (root.opened && openWake.running)
+    running: root.starting || root.setupRunning || (root.opened && openWake.running)
     loops: Animation.Infinite
     NumberAnimation { target: pulse; property: "value"; to: 0.35; duration: 700; easing.type: Easing.InOutSine }
     NumberAnimation { target: pulse; property: "value"; to: 1; duration: 700; easing.type: Easing.InOutSine }
@@ -2953,13 +3081,63 @@ Panel {
         }
       }
 
+      // ---------------- first run: install the app, then set it up ----------------
+      Column {
+        id: setupCol
+        anchors.centerIn: parent
+        width: parent.width * 0.6
+        spacing: Style.space(14)
+        visible: root.setupScreen
+        Text {
+          anchors.horizontalCenter: parent.horizontalCenter
+          textFormat: Text.PlainText
+          text: root.gYouTube
+          color: Color.accent
+          font.family: root.fontFamily
+          font.pixelSize: Style.space(56)
+          opacity: root.setupRunning ? pulse.value : 1
+        }
+        Text {
+          anchors.horizontalCenter: parent.horizontalCenter
+          textFormat: Text.PlainText
+          text: !root.appInstalled ? "YouTube Music isn't installed"
+            : root.setupRunning ? "Setting up YouTube Music…"
+            : root.setupError !== "" ? "Setup didn't finish" : "One step before it works"
+          color: root.fg
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.subtitle
+          font.bold: true
+        }
+        Text {
+          width: parent.width
+          horizontalAlignment: Text.AlignHCenter
+          wrapMode: Text.Wrap
+          textFormat: Text.PlainText
+          text: !root.appInstalled
+            ? "This widget is a remote for the YouTube Music desktop app (pear-desktop). Install opens a terminal where yay installs pear-desktop-bin from the AUR and asks you to confirm. This screen moves on by itself when it's done."
+            : root.setupRunning ? "The app starts and quits once while this runs. It takes about half a minute."
+            : root.setupError !== "" ? root.setupError
+            : "Set up turns on the app's local API and locks it to this widget with a private token, turns off the app's tray and start-at-login, and adds a YouTube Music menu entry. It doesn't touch anything else. Sign in inside the app afterwards if it asks."
+          color: root.a(root.fg, 0.6)
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+        }
+        Button {
+          visible: !root.setupRunning
+          anchors.horizontalCenter: parent.horizontalCenter
+          text: !root.appInstalled ? "Install" : root.setupError !== "" ? "Try again" : "Set up"
+          bordered: true
+          onClicked: !root.appInstalled ? root.installApp() : root.runSetup()
+        }
+      }
+
       // ---------------- app waking up, closed, or failed to start ----------------
       Column {
         id: wakingCol
         anchors.centerIn: parent
         width: parent.width * 0.6
         spacing: Style.space(14)
-        visible: !root.appUp
+        visible: !root.appUp && !root.setupScreen
         // "Waking up" while starting and during the panel's short wait before a
         // wake, so opening the panel never flashes "closed". Otherwise the app
         // is closed (it quit or crashed while the panel was open; the retry

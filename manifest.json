@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "nic.youtube-music",
   "name": "YouTube Music",
-  "version": "2.3.8",
+  "version": "2.4.0",
   "author": "nicolasfalesy (built on Omarchy's Media widget)",
   "license": "MIT",
   "description": "Full remote for the YouTube Music desktop app (pear-desktop): now playing, up next, search, library and playlists, queue, like, shuffle, repeat, volume, and word-by-word lyrics. Starts the app in the background on demand and quits it when idle.",

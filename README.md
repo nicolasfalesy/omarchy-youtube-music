@@ -32,41 +32,39 @@ hidden in the background, starts when you need it, and quits when you don't.
 
 ## Setup
 
-1. **Install the app**, start it once from the app launcher, sign in to your account, and quit
-   it:
-
-   ```bash
-   yay -S pear-desktop-bin
-   ```
-
-2. **Add the plugin:**
+1. **Add the plugin:**
 
    ```bash
    omarchy plugin add https://github.com/nicolasfalesy/omarchy-youtube-music.git --enable
    ```
 
-3. **Hide the app's window** on the music workspace. Add this to `~/.config/hypr/hyprland.lua`:
+2. **Open the panel** (click the widget in the bar). It walks you through the rest:
 
-   ```lua
-   o.window("com.github.th-ch.youtube-music", { workspace = "special:music silent" })
-   ```
+   - **If the YouTube Music app isn't installed**, it shows an **Install** button. That opens a
+     terminal running `yay -S --needed pear-desktop-bin`, where yay asks you to confirm. The
+     panel moves on by itself when the install finishes.
+   - **Then a Set up button**, with a short note on what it changes. Nothing is changed until
+     you click it. It takes a few seconds and runs `tools/setup` (below).
+   - **Sign in** inside the app if it asks: click the cover in the panel to show the app window.
 
-4. **Run the setup once** (safe to run again):
+That's all. The widget keeps the app's window on a hidden `special:music` workspace by itself:
+it adds a runtime Hyprland window rule named `nic-youtube-music` (with `hyprctl eval`, so no
+config file is edited), and adds it again after a config reload.
 
-   ```bash
-   ~/.config/omarchy/plugins/nic.youtube-music/tools/setup
-   ```
+### What Set up does
 
-   It turns on the app's API server (local only) and **locks it to this widget**: it mints a
-   token only the widget holds (saved mode 600 in `~/.local/state/omarchy/nic-youtube-music/token`)
-   and switches the app to `AUTH_AT_FIRST`, so any other program, or a web page, is refused. It
-   also adds a menu entry that starts the app through `tools/cdp-bridge` (see below), removes
-   any old `--remote-debugging-port` line from `~/.config/youtube-music-flags.conf`, and turns
-   off the app's `resumeOnStart`, tray and start-at-login (the widget does the resuming, and
-   quits the app when idle). If the app's API ever answers without the token again, the panel
-   says so. Setup only reports the API locked after checking that the app has quit and nothing
-   answers without the token; if the app will not quit, it says the API is still open, names
-   the process to close, and stops with an error (run it again after closing the app).
+It runs `~/.config/omarchy/plugins/nic.youtube-music/tools/setup`, which you can also run
+yourself from a terminal (safe to run again). On a first run it starts the app once so the app
+creates its settings. It turns on the app's API server (local only, `127.0.0.1`) and **locks it
+to this widget**: it mints a token only the widget holds (saved mode 600 in
+`~/.local/state/omarchy/nic-youtube-music/token`) and switches the app to `AUTH_AT_FIRST`, so
+any other program, or a web page, is refused. It also adds a menu entry that starts the app
+through `tools/cdp-bridge` (see below), removes any old `--remote-debugging-port` line from
+`~/.config/youtube-music-flags.conf`, and turns off the app's `resumeOnStart`, tray and
+start-at-login (the widget does the resuming, and quits the app when idle). If the app's API
+ever answers without the token again, the panel says so. Setup only reports the API locked
+after checking that the app has quit and nothing answers without the token; if the app will
+not quit, it says the API is still open, names the process to close, and stops with an error.
 
 ### How the widget reaches the app, and why no port is open
 
@@ -100,9 +98,16 @@ rm -rf ~/.local/state/omarchy/nic-youtube-music
 rm -f ~/.local/share/applications/com.github.th-ch.youtube-music.desktop
 ```
 
-Then remove the `o.window(...)` line from `~/.config/hypr/hyprland.lua`, and, with the app
-closed, turn its API server off in `~/.config/YouTube Music/config.json` (or leave it on: it
-stays locked to a token nothing holds any more).
+With the app closed, turn its API server off in `~/.config/YouTube Music/config.json` (or leave
+it on: it stays locked to a token nothing holds any more). The window rule the widget added
+goes away at the next Hyprland reload or login; to drop it at once:
+
+```bash
+hyprctl eval 'hl.window_rule({ name = "nic-youtube-music", enabled = false, match = { class = "com.github.th-ch.youtube-music" } })'
+```
+
+If you added an `o.window(...)` line for this app to `~/.config/hypr/hyprland.lua` with an older
+version of this plugin, you can remove it (it does no harm either way).
 
 ## What it sends where
 

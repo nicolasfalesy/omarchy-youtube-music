@@ -70,7 +70,13 @@ set_strategy() {
   replace_with "$cfg" 600 jq --arg s "$1" '.plugins["api-server"].authStrategy = $s' "$cfg"
 }
 # What config.json says now, read back rather than assumed from a write.
-strategy_is() { [[ $(jq -r '.plugins["api-server"].authStrategy // "NONE"' "$cfg" 2>/dev/null) == "$1" ]]; }
+# A missing authStrategy is the app's own default, AUTH_AT_FIRST (pear-desktop
+# 3.12 api-server defaults). Reading it as NONE left a fresh install's API
+# locked while this script waited for it to answer without a token, so a first
+# setup always failed with "the API did not come up" (found testing the
+# panel's Set up on a new profile, 2026-09-28).
+strategy_now() { jq -r '.plugins["api-server"].authStrategy // "AUTH_AT_FIRST"' "$cfg" 2>/dev/null; }
+strategy_is() { [[ $(strategy_now) == "$1" ]]; }
 
 # Quit the app: through the widget first, then Browser.close straight to the
 # bridge's socket (in case the shell is down), and SIGKILL only as the last
@@ -135,7 +141,7 @@ trap 'exit 143' TERM
 trap 'exit 129' HUP
 
 [[ -f $cfg ]] || { echo "No $cfg: start YouTube Music once and sign in first." >&2; exit 1; }
-strategy=$(jq -r '.plugins["api-server"].authStrategy // "NONE"' "$cfg")
+strategy=$(strategy_now)
 
 # "Already locked" needs the API to refuse a caller without a token too: after
 # a run where the app would not quit, config.json says AUTH_AT_FIRST and the
