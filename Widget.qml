@@ -668,13 +668,29 @@ Panel {
         // seek once (see POSITION_CHANGED).
         root.resumeTarget = { videoId: ls.videoId, at: at, until: Date.now() + 20000 }
       } else root.resumeTarget = null
-      root.expect(ls.videoId)
-      root.page("window.__nicYtm.play(" + JSON.stringify({ watchEndpoint: ep }) + ")", function(v, err) {
-        if (err || v === false) {
-          root.unexpect()
-          root.resumeTarget = null
-          root.toast("Couldn't resume: " + (err || "the app is still loading."))
-        }
+      var navigate = function() {
+        root.expect(ls.videoId)
+        root.page("window.__nicYtm.play(" + JSON.stringify({ watchEndpoint: ep }) + ")", function(v, err) {
+          if (err || v === false) {
+            root.unexpect()
+            root.resumeTarget = null
+            root.toast("Couldn't resume: " + (err || "the app is still loading."))
+          }
+        })
+      }
+      if (ep.startTimeSeconds !== undefined) { navigate(); return }
+      // The app restores the last song as a cue on its own when it starts. A
+      // navigate to that same song with no start time is a no-op on YouTube
+      // Music's page (player stays at -1, unstarted), so play pressed after a
+      // wake without play did nothing (reported 2026-09-28; reproduced: woken
+      // app, "Stay With Me @0" cued, play pressed, page unchanged). The app's
+      // own /play starts a cue, so that song gets /play instead, as the play
+      // button does for a song that is already the user's.
+      root.page("window.__nicYtm.state()", function(sv) {
+        if (!sv || sv.videoId !== ls.videoId) { navigate(); return }
+        root.cmd("/play")
+        root.songReal = true
+        root.lastPush = Date.now()
       })
     })
   }
