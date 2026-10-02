@@ -2480,11 +2480,21 @@ Panel {
   }
   // With word timing the clock runs every frame while music plays, so a word
   // fills smoothly; 20 steps a second showed as steps. Only the sung line's
-  // words read it.
+  // words read it. At most about 60 times a second, though: on a 144 or
+  // 165 Hz monitor every frame re-ran the sung line's bindings for no
+  // visible gain (deep review 2026-10-01). wordFrameDue() lets a frame
+  // through once 1/60 s (less a millisecond of slack) has gone by.
+  property real wordFrameAcc: 0
+  function wordFrameDue(dt) {
+    wordFrameAcc += Math.max(0, dt)
+    if (wordFrameAcc < 1 / 60 - 0.001) return false
+    wordFrameAcc = 0
+    return true
+  }
   FrameAnimation {
     id: wordFrames
     running: root.lyricsLive && root.lyricsWords && root.lyricsAnchor.playing
-    onTriggered: root.tickLyrics()
+    onTriggered: if (root.wordFrameDue(frameTime)) root.tickLyrics()
   }
   // Words light a touch ahead of the voice, as they do in Apple Music.
   readonly property real wordLead: 0.05
