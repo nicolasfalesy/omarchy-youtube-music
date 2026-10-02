@@ -92,7 +92,10 @@ def main():
     os.environ["YTM_SINK_PID"] = str(syslog_sink())
     child = os.fork()
     if child == 0:
-        os._exit(run_tests(patterns, names))
+        code = run_tests(patterns, names)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(code)
     code = 1
     while True:
         try:

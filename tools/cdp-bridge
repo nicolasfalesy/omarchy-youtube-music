@@ -198,6 +198,29 @@ def dump(msg):
         return None
 
 
+def split_frames(buf, chunk, sep):
+    """Add chunk to buf (a bytearray, changed in place) and return the whole
+    frames it completes. Only the new chunk is searched for the separator, so
+    a big message costs one pass, not one rescan and recopy of everything so
+    far for each 64 KB read (that made a 24 MB answer cost 1.2 s of CPU,
+    2026-10-01 review)."""
+    if sep not in chunk:
+        buf += chunk
+        return []
+    parts = chunk.split(sep)
+    buf += parts[0]
+    frames = [bytes(buf)] + parts[1:-1]
+    buf[:] = parts[-1]
+    return frames
+
+
+# Chromium writes every answer as {"id":N,...}. Swapping N for the asker's id
+# as bytes skips parsing and re-encoding the whole answer (a few MB for the
+# library). Anything else takes the JSON path, which also re-encodes an
+# answer that holds a raw newline, so it cannot break the socket's framing.
+ANSWER_HEAD = re.compile(rb'\{"id":(\d+),')
+
+
 def peer_uid(conn):
     creds = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
     return struct.unpack("3i", creds)[1]
@@ -285,7 +308,7 @@ def main():
     outq = {}     # socket -> bytes waiting to be sent to it
     routes = {}   # bridge id -> (socket, the id that connection used)
     next_id = 0
-    from_app = b""
+    from_app = bytearray()
     skipping = False  # inside an app message over MAX_MESSAGE, until its end
 
     def drop(conn):
@@ -340,21 +363,20 @@ def main():
                     conn.close()
                 else:
                     conn.setblocking(False)
-                    clients[conn] = b""
+                    clients[conn] = bytearray()
                     outq[conn] = bytearray()
             if from_app_r in ready:
                 chunk = os.read(from_app_r, 1 << 20)
                 if not chunk:
                     break  # the app closed its end: it is quitting
-                from_app += chunk
-                *messages, from_app = from_app.split(b"\0")
+                messages = split_frames(from_app, chunk, b"\0")
                 out = {}  # socket -> lines to send
                 if skipping:
                     if messages:
                         messages.pop(0)  # the end of the message being dropped
                         skipping = False
                     else:
-                        from_app = b""
+                        from_app.clear()
                 if len(from_app) > MAX_MESSAGE:
                     # Answer the asker with an error rather than leave it waiting.
                     m = re.match(rb'\{"id":(\d+),', from_app)
@@ -363,9 +385,17 @@ def main():
                     if route and route[0] in clients:
                         out.setdefault(route[0], []).append(dump({"id": route[1], "error": {
                             "code": -32000, "message": "cdp-bridge: answer over %d MiB dropped" % (MAX_MESSAGE >> 20)}}))
-                    from_app = b""
+                    from_app.clear()
                     skipping = True
                 for raw in messages:
+                    m = ANSWER_HEAD.match(raw)
+                    if m and b"\n" not in raw:
+                        route = routes.pop(int(m.group(1)), None)
+                        if route and route[0] in clients:
+                            their_id = dump(route[1])
+                            if their_id is not None:
+                                out.setdefault(route[0], []).append(b'{"id":' + their_id + b"," + raw[m.end():])
+                        continue
                     msg = parse(raw)
                     if msg is None:
                         continue
@@ -394,12 +424,11 @@ def main():
                 if not chunk:
                     drop(conn)
                     continue
-                *lines, rest = (clients[conn] + chunk).split(b"\n")
-                if len(rest) > MAX_MESSAGE:
+                lines = split_frames(clients[conn], chunk, b"\n")
+                if len(clients[conn]) > MAX_MESSAGE:
                     say("dropped a connection that sent a line over %d MiB" % (MAX_MESSAGE >> 20))
                     drop(conn)
                     continue
-                clients[conn] = rest
                 for line in lines:
                     msg = parse(line)
                     if msg is None:

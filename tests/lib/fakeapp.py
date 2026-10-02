@@ -17,7 +17,8 @@ $FAKE_LOG, so a test can check what reached the app:
     Bearer JWT (HS256, the config's secret) whose id is in authorizedClients.
     POST /auth/<id> mints a token, under NONE only. Each request is logged with
     whether it carried a valid token, never the token itself.
-Runtime.evaluate of "fake.big:<bytes>", "fake.event" or "fake.bad" are test
+Runtime.evaluate of "fake.big:<bytes>", "fake.event", "fake.bad" or
+"fake.newline" are test
 hooks (see fake()).
 Control files in $FAKE_CTL: noquit (ignore Browser.close and pipe EOF),
 mint_empty (mint answers {}), die_after_mint (exit right after a mint),
@@ -192,6 +193,8 @@ class App:
         sends an event first, fake.bad sends malformed messages first."""
         if expr.startswith("fake.big:"):
             return self.answer(cmd, {"blob": "x" * int(expr.split(":")[1])})
+        if expr == "fake.newline":  # not valid JSON: a raw newline inside a string
+            return self.send(b'{"id":%d,"result":{"v":"a\nb"}}' % cmd["id"])
         if expr == "fake.event":
             self.send(json.dumps({"method": "Fake.event", "params": {}}, separators=(",", ":")).encode())
         elif expr == "fake.bad":

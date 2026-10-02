@@ -7,6 +7,11 @@ import time
 from ytmtest import Case, Conn, wait_until
 
 
+def cpu_seconds(pid):
+    fields = open("/proc/%d/stat" % pid).read().rsplit(")", 1)[1].split()
+    return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
+
+
 class BridgeTest(Case):
     def test_relay_each_answer_goes_to_the_connection_that_asked(self):
         self.bridge_up()
@@ -214,6 +219,36 @@ class BridgeTest(Case):
         self.assertTrue(wait_until(lambda: any("ignoring --inspect " in line for line in lines()), 2), lines())
         self.assertTrue(wait_until(lambda: any("Network.getAllCookies" in line for line in lines()), 2), lines())
         self.assertFalse(any("9229" in line for line in lines()), "only the switch name is logged")
+
+    def test_a_big_answer_costs_the_bridge_little_cpu(self):
+        # Measured 2026-10-01: 24 MB took 1.2 s of bridge CPU before the
+        # buffer and id-swap change, about 20 ms after. The limit leaves room
+        # for slow machines but fails on the old quadratic path.
+        p = self.bridge_up()
+        c = Conn(self.sock)
+        costs = []
+        for i in range(3):
+            before = cpu_seconds(p.pid)
+            c.send({"id": i, "method": "Runtime.evaluate", "params": {"expression": "fake.big:24000000"}})
+            self.assertEqual(len(c.recv(timeout=30)["result"]["blob"]), 24_000_000)
+            costs.append(cpu_seconds(p.pid) - before)
+        self.assertLess(sorted(costs)[1], 0.25, costs)
+
+    def test_answers_in_other_shapes_still_route(self):
+        self.ctl_on("spaced")  # {"result": ..., "id": N}: the JSON path
+        self.bridge_up()
+        a, b = Conn(self.sock), Conn(self.sock)
+        a.send({"id": "x", "method": "Target.getTargets", "params": {}})
+        b.send({"id": 1, "method": "Runtime.evaluate", "params": {"expression": "1"}})
+        self.assertEqual(a.recv()["id"], "x")
+        self.assertEqual(b.recv(), {"id": 1, "result": {"echo": "Runtime.evaluate"}})
+
+    def test_an_answer_with_a_raw_newline_never_breaks_the_framing(self):
+        self.bridge_up()
+        c = Conn(self.sock)
+        c.send({"id": 1, "method": "Runtime.evaluate", "params": {"expression": "fake.newline"}})
+        c.send({"id": 2, "method": "Runtime.evaluate", "params": {"expression": "1"}})
+        self.assertEqual(c.recv()["id"], 2, "the broken answer is dropped whole, the next one arrives")
 
 
 def race_once(case):
