@@ -3373,10 +3373,14 @@ Panel {
   })
   // Whether a URL is https on one of Google's image hosts (the ones above, the
   // twins they retry on, and www.gstatic.com, which serves a few covers).
+  // Also any numbered twin of those families (i9.ytimg.com, lh7.googleusercontent.com,
+  // yt5.ggpht.com): Google spreads covers over more numbers than the retry list
+  // names, and a refused real cover would just go blank. Whole-name matches
+  // only, so look-alikes (ytimg.com.example, i1.ytimg.com@host) never pass.
   function artHostOk(h) {
     if (h === "www.gstatic.com") return true
     for (var k in artHosts) if (k === h || artHosts[k].indexOf(h) >= 0) return true
-    return false
+    return /^(?:i[0-9]?\.ytimg\.com|lh[0-9]\.googleusercontent\.com|yt[0-9]\.(?:ggpht|googleusercontent)\.com)$/.test(h)
   }
   function artUrlOk(u) {
     var m = /^https:\/\/([A-Za-z0-9.-]+)(\/\S*)?$/.exec(typeof u === "string" ? u : "")

@@ -26,6 +26,11 @@ TestCase {
     compare(w.artAt("https://lh3.googleusercontent.com/a=w120", 0), "https://lh3.googleusercontent.com/a=w120")
     compare(w.artAt("https://lh3.googleusercontent.com/a=w120", 1), "https://lh4.googleusercontent.com/a=w120")
     compare(w.artAt("https://www.gstatic.com/a.png", 1), "https://www.gstatic.com/a.png?try=1")
+    // Numbered twins outside the retry lists still load (checker, 2026-10-01).
+    var good = ["https://i9.ytimg.com/vi/x/mq.jpg", "https://lh7.googleusercontent.com/a", "https://yt5.ggpht.com/a"]
+    for (var j = 0; j < good.length; j++) compare(w.artAt(good[j], 0), good[j], good[j])
+    var evil = ["https://i9.ytimg.com.example.com/x", "https://lh77.googleusercontent.com/x", "https://xi9.ytimg.com/x"]
+    for (var k = 0; k < evil.length; k++) compare(w.artAt(evil[k], 0), "", evil[k])
   }
 
   function test_rows_with_bad_art_load_nothing() {
