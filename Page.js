@@ -1,7 +1,8 @@
 .pragma library
 
-// Code that runs INSIDE the YouTube Music app page (pear-desktop), sent over
-// the app's debug port (127.0.0.1:9223) with Runtime.evaluate.
+// Code that runs INSIDE the YouTube Music app page (pear-desktop), sent with
+// Runtime.evaluate over the DevTools protocol on the app's private pipe
+// (tools/cdp-bridge; no debug port is ever opened).
 //
 // Why this exists: the app's own control server (127.0.0.1:26538) covers
 // playback, likes, shuffle, repeat and volume, but has no way to list your

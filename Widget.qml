@@ -46,14 +46,16 @@ import "Page.js" as Page
 //
 // The app runs only while it is needed (the brief: run it in the background,
 // never keep it running when it is not needed, and keep it all seamless):
-//   - Its window lives on the hidden "music" workspace (rule in
-//     ~/.config/hypr/hyprland.lua); the cover art in the panel toggles it.
+//   - Its window lives on the hidden "music" workspace (a window rule the
+//     widget adds at runtime, see ensureWindowRule); the cover art in the
+//     panel toggles it.
 //   - Pressing play starts it in the background, and so does opening the panel
 //     (after 400 ms, so Tab passing through the panels does not count).
-//   - After idleMinutes (default 5) paused, with the panel closed on every
-//     monitor and the app window not on screen, it quits cleanly over the debug
-//     port (Browser.close; a plain kill made Chromium crash on purpose and pop a
-//     crash notice). The page gets one last look first, in case music plays.
+//   - After idleMinutes (default 5, at least 1; 2 on battery) paused, with
+//     the panel closed on every monitor and the app window not on screen, it
+//     quits cleanly with Browser.close through the bridge's private socket (a
+//     plain kill made Chromium crash on purpose and pop a crash notice). The
+//     page gets one last look first, in case music plays.
 //   - The last song, position and playlist are kept in
 //     ~/.local/state/omarchy/nic-youtube-music/last.json, so the bar keeps
 //     showing it while the app is closed and play resumes right where it was.
@@ -584,9 +586,6 @@ Panel {
       })
     }
   }
-  // With nothing of the user's loaded, next and previous resume the remembered
-  // song instead (a middle click on a closed app should not skip a song never
-  // heard).
   // Pause if something plays; never start, never wake the app. /pause is the
   // app's pauseVideo(), which does nothing on a paused or cued player.
   function pauseOnly() {
@@ -597,6 +596,9 @@ Panel {
     isPlaying = false
     cmd("/pause")
   }
+  // With nothing of the user's loaded, next and previous resume the remembered
+  // song instead (a middle click on a closed app should not skip a song never
+  // heard).
   function next() { if (nothingReal()) { wake("play"); return } expect(""); cmd("/next") }
   function previous() { if (nothingReal()) { wake("play"); return } expect(""); cmd("/previous") }
 
@@ -1597,7 +1599,6 @@ Panel {
   property var cdpDeadline: ({})
   readonly property int cdpTimeoutMs: 20000
   property var cdpQueue: []                // [{id, msg, offlineOk}] waiting for the socket
-  property bool cdpLooking: false
   // pear swaps in its own offline page (assets/error.html) whenever a page
   // load fails (index.js did-fail-load, which does not even check for the main
   // frame). Its Retry reloads only the FOCUSED window, and ours sits hidden on
@@ -1891,12 +1892,6 @@ Panel {
     onTriggered: root.retryAppPage()
   }
 
-  // Reads searchText itself, not the searching binding: clearing the search
-  // calls this from onSearchTextChanged, where Qt 6.11 still hands back the
-  // old value of a binding on searchText (the handler runs before the binding
-  // updates). It saw "still searching", ran an empty search that did nothing,
-  // and Home never came back (offline test through the keyboard, 2026-09-24;
-  // the same trap as in World Radio's memory note).
   // ------------------------------------------------------------ lyrics
   // Asked for 2026-09-24: lyrics "as good as Apple Music does", and then for
   // them to follow each word. Word timing comes from KuGou (see kugouLookup),
@@ -2544,6 +2539,12 @@ Panel {
     lyricIndex = i
   }
 
+  // Reads searchText itself, not the searching binding: clearing the search
+  // calls this from onSearchTextChanged, where Qt 6.11 still hands back the
+  // old value of a binding on searchText (the handler runs before the binding
+  // updates). It saw "still searching", ran an empty search that did nothing,
+  // and Home never came back (offline test through the keyboard, 2026-09-24;
+  // the same trap as in World Radio's memory note).
   function refresh() {
     if (!appUp) return
     checkOffline()
