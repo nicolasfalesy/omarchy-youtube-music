@@ -1550,7 +1550,12 @@ Panel {
       var target = null, offline = null
       for (var i = 0; i < list.length; i++) {
         if (list[i].type !== "page") continue
-        if (String(list[i].url).indexOf("music.youtube.com") !== -1) target = list[i]
+        // Exactly https://music.youtube.com, nothing else: a substring check
+        // also took Google's sign-in and consent pages, whose continue=
+        // names music.youtube.com, and look-alike hosts (deep review
+        // 2026-10-01). Anything after the host must start a path, query or
+        // fragment, so "@other.host" or ".other.host" never passes.
+        if (/^https:\/\/music\.youtube\.com(?:[\/?#]|$)/.test(String(list[i].url))) target = list[i]
         else if (/\/assets\/error\.html$/.test(String(list[i].url))) offline = list[i]
       }
       if (target) { root.cdpAttach(target.targetId, "music"); return }
