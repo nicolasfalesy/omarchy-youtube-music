@@ -426,11 +426,25 @@ Panel {
     onFileChanged: reload()
   }
 
+  // Answers past restMaxChars are cut off. XMLHttpRequest has no size limit
+  // of its own and read the whole answer into the shell before parsing it on
+  // the UI thread (a 64 MiB answer was read in full, deep review
+  // 2026-10-01); the app's real answers are a few KB. The request is aborted
+  // as soon as the text passes the cap, and the caller gets status 0 and no
+  // data, like any failed call.
+  readonly property int restMaxChars: 4 * 1024 * 1024
   function call(method, path, body, cb) {
     var x = new XMLHttpRequest()
+    var over = false, answered = false
     x.onreadystatechange = function() {
-      if (x.readyState !== XMLHttpRequest.DONE) return
+      if (x.readyState === XMLHttpRequest.LOADING && !over && x.responseText.length > root.restMaxChars) {
+        over = true
+        x.abort()
+      }
+      if (x.readyState !== XMLHttpRequest.DONE || answered) return
+      answered = true
       if (!cb) return
+      if (over || x.responseText.length > root.restMaxChars) { cb(0, null); return }
       var data = null
       try { data = x.responseText ? JSON.parse(x.responseText) : null } catch (e) {}
       cb(x.status, data)

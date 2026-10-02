@@ -63,6 +63,14 @@ check() {
   fi
 }
 
+# A stand-in for the app's REST API (data/fakeapi.py) on 127.0.0.1:26599,
+# inside this namespace only. Loopback starts down in a new namespace.
+ip link set lo up 2>/dev/null || true
+python3 "$here/data/fakeapi.py" 26599 >/dev/null 2>&1 &
+api_pid=$!
+trap 'kill $api_pid 2>/dev/null; rm -rf "$scratch"' EXIT
+for i in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/26599) 2>/dev/null && break; sleep 0.1; done
+
 log="$scratch/all.log"
 qt -input "$input" > "$log" 2>&1 || true
 [ -n "${YTM_QML_LOG:-}" ] && cp "$log" "$YTM_QML_LOG"
