@@ -1337,8 +1337,11 @@ Panel {
     x.open("GET", root.api + "/volume")
     x.send()
   }
+  // Points at the panel's own Set up (a button in the toast), not at a
+  // terminal step: the panel has done setup itself since 2.4.0.
   function warnApiOpen() {
-    toastFor("The app's API answers any program. Run tools/setup in the plugin folder to lock it.", 8000)
+    toastFor("The app's API answers any program. Set up locks it to this widget (the app restarts once).", 10000,
+      { label: "Set up", run: function() { root.runSetup() } })
   }
 
   function markUp() {
@@ -2886,14 +2889,23 @@ Panel {
   // desktop notification: the text is notify-send's summary, which the
   // notification spec defines as plain text, passed as one argument after
   // "--", so nothing in a song title reads as an option.
-  function toastFor(t, ms) {
+  // action (optional): {label, run}, a button in the toast.
+  function toastFor(t, ms, action) {
     var ps = peers()
-    for (var i = 0; i < ps.length; i++) if (ps[i] && ps[i] !== root && ps[i].opened) { ps[i].showToast(t, ms); return }
-    if (opened) { showToast(t, ms); return }
+    for (var i = 0; i < ps.length; i++) if (ps[i] && ps[i] !== root && ps[i].opened) { ps[i].showToast(t, ms, action); return }
+    if (opened) { showToast(t, ms, action); return }
     Quickshell.execDetached(["notify-send", "--app-name=YouTube Music", "--", String(t)])
   }
-  function showToast(t, ms) { toastText = t; toastTimer.interval = ms; toastTimer.restart() }
-  Timer { id: toastTimer; interval: 2600; onTriggered: root.toastText = "" }
+  property string toastActionLabel: ""
+  property var toastAction: null
+  function showToast(t, ms, action) {
+    toastText = t
+    toastActionLabel = action ? action.label : ""
+    toastAction = action ? action.run : null
+    toastTimer.interval = ms
+    toastTimer.restart()
+  }
+  Timer { id: toastTimer; interval: 2600; onTriggered: { root.toastText = ""; root.toastActionLabel = ""; root.toastAction = null } }
 
   function fmt(sec) {
     sec = Math.max(0, Math.floor(sec || 0))
@@ -4655,22 +4667,42 @@ Panel {
         visible: opacity > 0
         opacity: root.toastText !== "" ? 1 : 0
         Behavior on opacity { NumberAnimation { duration: 160 } }
-        width: toastT.width + Style.space(24)
-        height: toastT.implicitHeight + Style.space(12)
+        width: toastRow.width + Style.space(24)
+        height: Math.max(toastT.implicitHeight, toastBtn.visible ? toastBtn.height : 0) + Style.space(12)
         radius: height / 2
         color: Color.popups.background
         border.width: 1
         border.color: root.a(Color.accent, 0.6)
-        Text {
-          id: toastT
+        Row {
+          id: toastRow
           anchors.centerIn: parent
-          width: Math.min(implicitWidth, Math.max(0, keys.width - Style.space(64)))
-          elide: Text.ElideRight
-          textFormat: Text.PlainText
-          text: root.toastText
-          color: root.fg
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.caption
+          spacing: Style.space(10)
+          Text {
+            id: toastT
+            anchors.verticalCenter: parent.verticalCenter
+            width: Math.min(implicitWidth, Math.max(0, keys.width - Style.space(64) - (toastBtn.visible ? toastBtn.width + toastRow.spacing : 0)))
+            elide: Text.ElideRight
+            textFormat: Text.PlainText
+            text: root.toastText
+            color: root.fg
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+          Button {
+            id: toastBtn
+            anchors.verticalCenter: parent.verticalCenter
+            visible: root.toastActionLabel !== ""
+            text: root.toastActionLabel
+            fontSize: Style.font.caption
+            bordered: true
+            onClicked: {
+              var run = root.toastAction
+              root.toastText = ""
+              root.toastActionLabel = ""
+              root.toastAction = null
+              if (run) run()
+            }
+          }
         }
       }
     }
