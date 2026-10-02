@@ -1036,7 +1036,11 @@ Panel {
   }
   property int volSent: -1
   property double volSentAt: 0
+  // An echo equal to the value sent is taken as it is: upstream pear-desktop
+  // PR #4672 makes the app report the volume it was given, and that echo
+  // went through the curve a second time (57 came back as 81).
   function takeAppVolume(r) {
+    if (volSent >= 0 && Math.round(r) === volSent) { volume = volSent; return }
     if (volSent >= 0 && Math.abs(volCurveMap(volSent, 0, 1) - r) <= 1.5) { volume = volSent; return }
     if (ageMs(volSentAt) < 1000) return
     volSent = -1
