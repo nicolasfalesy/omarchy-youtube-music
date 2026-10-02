@@ -2974,8 +2974,9 @@ Panel {
     + "This screen moves on by itself when it's done."
   // Everything tools/setup changes, so "nothing else" is true.
   readonly property string setupText: "Set up turns on the app's local API (on 127.0.0.1 only) and locks it to this widget "
-    + "with a private token. It turns off the app's tray, start at login and resume on start (the widget does the resuming), "
-    + "takes any old debug-port lines out of ~/.config/youtube-music-flags.conf (keeping a backup next to it), "
+    + "with a private token. It turns off the app's tray, start at login, resume on start and its own updater "
+    + "(the widget does the resuming, the package manager the updates), takes any old debugging lines out of "
+    + "~/.config/youtube-music-flags.conf (keeping a backup next to it), "
     + "and adds a YouTube Music menu entry. The app starts and quits once while it runs. Nothing else changes. "
     + "Sign in inside the app afterwards if it asks."
   // Assumed installed until checked, so a normal start never flashes the
