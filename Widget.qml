@@ -754,15 +754,37 @@ Panel {
   // has no title.
   function forgetLast() { shareLast(null) }
   function takeLast(t) {
-    try {
-      var v = JSON.parse(t)
-      if (v && v.title) {
-        root.lastSong = v
-        if (!root.appUp) { root.position = Number(v.elapsedSeconds || 0); root.reportedPosition = root.position }
-        return true
-      }
-    } catch (e) {}
-    return false
+    var v = cleanLast(t)
+    if (!v) return false
+    root.lastSong = v
+    if (!root.appUp) { root.position = v.elapsedSeconds; root.reportedPosition = root.position }
+    return true
+  }
+  // last.json is read back on every shell start. Only this widget writes it,
+  // but nothing stops another program or a broken write from putting anything
+  // there, and what it holds is drawn in the bar, sent to the page and loaded
+  // as an image. So only the shape saveLast() writes comes back out: a whole
+  // file of at most 64 Ki characters (a 50 MB title once took 6.8 s and 2.2 GB
+  // to lay out a single Text, deep review 2026-10-01), plain strings cut to
+  // 1000 characters, YouTube-shaped ids, seconds within a day, and cover art
+  // only from Google's image hosts. Anything else is "nothing remembered".
+  readonly property int lastMaxChars: 64 * 1024
+  readonly property var ytId: /^[A-Za-z0-9_-]{1,64}$/
+  function cleanLast(t) {
+    if (typeof t !== "string" || t.length > lastMaxChars) return null
+    var v
+    try { v = JSON.parse(t) } catch (e) { return null }
+    if (!v || typeof v !== "object" || Array.isArray(v)) return null
+    if (typeof v.title !== "string" || v.title.trim() === "") return null
+    if (typeof v.videoId !== "string" || !ytId.test(v.videoId)) return null
+    var str = function(x) { return typeof x === "string" ? x.slice(0, 1000) : "" }
+    var secs = function(x) { var n = Number(x); return isFinite(n) ? Math.min(86400, Math.max(0, n)) : 0 }
+    return {
+      title: v.title.slice(0, 1000), artist: str(v.artist), album: str(v.album),
+      imageSrc: artUrlOk(v.imageSrc) ? v.imageSrc : "",
+      videoId: v.videoId, playlistId: typeof v.playlistId === "string" && ytId.test(v.playlistId) ? v.playlistId : "",
+      songDuration: secs(v.songDuration), elapsedSeconds: Math.floor(secs(v.elapsedSeconds))
+    }
   }
   FileView {
     id: lastFile
@@ -781,7 +803,7 @@ Panel {
     path: ""
     watchChanges: false
     printErrors: false
-    onLoaded: if (root.takeLast(text()) && root.isPrimary()) lastFile.setText(text())
+    onLoaded: if (root.takeLast(text()) && root.isPrimary()) lastFile.setText(JSON.stringify(root.lastSong, null, 2) + "\n")
   }
   Timer {
     id: saveTimer
@@ -2911,6 +2933,17 @@ Panel {
     "lh3.googleusercontent.com": ["lh4.googleusercontent.com", "lh5.googleusercontent.com", "lh6.googleusercontent.com"],
     "i.ytimg.com": ["i1.ytimg.com", "i2.ytimg.com", "i3.ytimg.com"]
   })
+  // Whether a URL is https on one of Google's image hosts (the ones above, the
+  // twins they retry on, and www.gstatic.com, which serves a few covers).
+  function artHostOk(h) {
+    if (h === "www.gstatic.com") return true
+    for (var k in artHosts) if (k === h || artHosts[k].indexOf(h) >= 0) return true
+    return false
+  }
+  function artUrlOk(u) {
+    var m = /^https:\/\/([A-Za-z0-9.-]+)(\/\S*)?$/.exec(typeof u === "string" ? u : "")
+    return !!m && artHostOk(m[1].toLowerCase())
+  }
   // The URL for try number `attempt` (0 = as given). Hosts without known
   // twins (www.gstatic.com) just ask again, which works once Qt has dropped
   // the dead connection.

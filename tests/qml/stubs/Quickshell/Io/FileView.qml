@@ -16,8 +16,12 @@ QtObject {
   signal saveFailed(int error)
   signal fileChanged()
   function text() { return _text }
-  function reload() { Qt.callLater(f._load) }
+  // Loads once, a moment after the path is set (or reload() is called).
+  property bool _queued: false
+  function reload() { _schedule() }
+  function _schedule() { if (_queued) return; _queued = true; Qt.callLater(f._load) }
   function _load() {
+    _queued = false
     if (path === "") return
     var v = Harness.files[path]
     if (v === undefined) { _text = ""; loadFailed(1); return }
@@ -33,5 +37,6 @@ QtObject {
     _text = String(t)
     Qt.callLater(function() { f.saved() })
   }
-  onPathChanged: Qt.callLater(f._load)
+  onPathChanged: _schedule()
+  Component.onCompleted: _schedule()
 }

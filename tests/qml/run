@@ -49,11 +49,16 @@ qt() {
 }
 
 fail=0
+own_warnings() {
+  grep -E "(Widget\.qml|Page\.js):[0-9]+" "$1" | grep -vE "^(PASS|QDEBUG)" | grep -vE "QML (ArtImage|Image): "
+}
 check() {
   # $1: log. A test failure, or any warning from the widget's own files.
   if grep -E "^(FAIL|Totals:.* [1-9][0-9]* failed)" "$1" >/dev/null; then fail=1; fi
-  if grep -E "(Widget\.qml|Page\.js):[0-9]+" "$1" | grep -vE "^(PASS|QDEBUG)" >/dev/null; then
-    echo "--- warnings from the widget's own files:"; grep -E "(Widget\.qml|Page\.js):[0-9]+" "$1" | grep -vE "^(PASS|QDEBUG)" | head -20
+  # Image load errors are Qt reporting a URL it could not fetch (there is no
+  # network in here), not a fault in the code.
+  if own_warnings "$1" >/dev/null; then
+    echo "--- warnings from the widget's own files:"; own_warnings "$1" | head -20
     fail=1
   fi
 }
