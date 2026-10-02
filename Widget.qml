@@ -1086,8 +1086,9 @@ Panel {
   function toggleMute() { cmd("/toggle-mute") }
   function toggleShuffle() { cmd("/shuffle"); root.shuffle = !root.shuffle }
   function cycleRepeat() { cmd("/switch-repeat", { iteration: 1 }) }
-  function like() { cmd("/like"); fetchLike() }
-  function dislike() { cmd("/dislike"); fetchLike() }
+  // Liked songs changes with these: its kept copy goes (see browseCache).
+  function like() { cmd("/like"); fetchLike(); dropTop("VLLM") }
+  function dislike() { cmd("/dislike"); fetchLike(); dropTop("VLLM") }
   function fetchLike() {
     likeTimer.restart()
   }
@@ -2550,8 +2551,102 @@ Panel {
     // another tab's message.
     else if (view === "queue") { serial += 1; loading = false; loadingMore = false; moreToken = ""; listError = ""; listFailed = false }
     else if (view === "lyrics") { serial += 1; loading = false; loadingMore = false; moreToken = ""; listError = ""; listFailed = false; loadLyrics() }
-    else if (view === "library") loadBrowse(libraryPage, "")
-    else loadBrowse("FEmusic_home", "")
+    else if (view === "library") showTop(libraryPage)
+    else showTop("FEmusic_home")
+  }
+
+  // Home and the Library pages are kept for browseCacheMs (asked for
+  // 2026-10-01): each panel open and each tab switch fetched them again,
+  // Home in six requests, with "Loading…" every time. A kept list now shows
+  // at once with no spinner and no fetch; once it is older than 10 minutes
+  // it still shows at once and a fresh copy loads quietly behind it (see
+  // quietRefresh). Only these top-level lists: albums, playlists and artists
+  // opened from them, and searches, always load. Pages loaded further down
+  // (paging) are kept too.
+  property var browseCache: ({})        // browseId -> {sections, header, moreToken, morePath, at}
+  readonly property int browseCacheMs: 10 * 60 * 1000
+  // The browseId of the top-level list on screen now, or "".
+  function topKey() {
+    if (searching || currentPage) return ""
+    if (view === "home") return "FEmusic_home"
+    if (view === "library") return libraryPage
+    return ""
+  }
+  function keepTop(id, at) {
+    if (!id || !sections.length) return
+    var c = browseCache
+    var old = c[id]
+    c[id] = { sections: sections, header: pageHeader, moreToken: moreToken, morePath: morePath,
+      at: at !== undefined ? at : (old ? old.at : Date.now()) }
+    browseCache = c
+  }
+  function dropTop(id) { var c = browseCache; delete c[id]; browseCache = c }
+  // Signed out (or into another account): nothing kept is theirs.
+  onSignedInChanged: if (!signedIn) browseCache = ({})
+  // Test hook: make every kept list look ms older.
+  function ageBrowseCache(ms) { for (var k in browseCache) browseCache[k].at -= ms }
+  function showTop(id) {
+    var c = browseCache[id]
+    if (!c) { loadBrowse(id, ""); return }
+    serial += 1
+    loading = false
+    loadingMore = false
+    listError = ""
+    listFailed = false
+    pageHeader = c.header
+    setList(c.sections, "", c.morePath)
+    moreToken = c.moreToken
+    moreEager = id === "FEmusic_home" && moreToken !== ""
+    if (ageMs(c.at) >= browseCacheMs) quietRefresh(id)
+  }
+  // A fresh copy of a kept list, fetched without touching the one on screen
+  // (Home with all its slices). It replaces the list on screen only while
+  // that list is still showing and scrolled to the top, so nothing moves
+  // under the reader; otherwise it waits in the cache for the next visit.
+  property int quietSerial: 0
+  function quietRefresh(id) {
+    quietSerial += 1
+    var mine = quietSerial
+    var secs = [], keys = {}, header = null
+    var add = function(list) {
+      for (var i = 0; i < list.length; i++) {
+        var its = []
+        for (var j = 0; j < list[i].items.length; j++) {
+          var k = root.rowKey(list[i].items[j])
+          if (keys[k]) continue
+          keys[k] = true
+          its.push(list[i].items[j])
+        }
+        if (its.length) secs.push({ title: list[i].title, items: its, more: list[i].more, cont: list[i].cont })
+      }
+    }
+    var finish = function(token) {
+      if (mine !== root.quietSerial || !secs.length) return
+      var c = root.browseCache
+      c[id] = { sections: secs, header: header, moreToken: token, morePath: "/browse", at: Date.now() }
+      root.browseCache = c
+      if (root.topKey() === id && !root.loading && list.contentY <= list.originY + 1) root.showTop(id)
+    }
+    // Home's further slices, as loadMore would fetch them (at most 10).
+    var more = function(token, left) {
+      if (!token || left <= 0) { finish(token || ""); return }
+      root.page("window.__nicYtm.more(" + JSON.stringify("/browse") + "," + JSON.stringify(token) + ")", function(v) {
+        if (mine !== root.quietSerial) return
+        if (!v || v.error) { finish(token); return }
+        if (v.items && v.items.length) add([{ title: "", items: v.items }])
+        add(v.sections || [])
+        more(v.cont || "", left - 1)
+      })
+    }
+    page("window.__nicYtm.browse(" + JSON.stringify(id) + "," + JSON.stringify("") + ")", function(v) {
+      if (mine !== root.quietSerial || !v || v.error) return
+      header = v.header
+      add(v.sections || [])
+      var last = secs.length ? secs[secs.length - 1] : null
+      var token = (last && last.cont) || v.cont || ""
+      if (id === "FEmusic_home") more(token, 10)
+      else finish(token)
+    })
   }
 
   // The list area's Try again. On pear's offline page, point the page back
@@ -2581,6 +2676,7 @@ Panel {
       if (!v || v.error) { root.listError = (v && v.error) || err || "Could not load this page."; root.listFailed = true; root.setList([], "", "/browse"); return }
       root.pageHeader = v.header
       root.setList(v.sections || [], v.cont || "", "/browse")
+      if (!params && root.topKey() === browseId) root.keepTop(browseId, Date.now())
       if (root.sections.length === 0) root.listError = root.signedIn ? "Nothing here yet" : "Sign in inside the YouTube Music app to see your library."
     })
   }
@@ -2733,6 +2829,7 @@ Panel {
       list.keepY = list.contentY
       root.sections = secs
       list.keepY = -1
+      root.keepTop(root.topKey())
       loadMoreSoon.restart()
     })
   }
