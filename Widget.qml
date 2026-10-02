@@ -816,7 +816,10 @@ Panel {
 
   // Quit when idle. Counts only while paused, the panel is closed on every
   // monitor, and the app is not on screen.
-  readonly property int idleLimit: (Number(setting("idleMinutes", 5)) || 5) * 60
+  // Never under a minute: 0.01 rounded to 0 s and a negative value went
+  // below 0, so the app quit at the first 15 s tick after every start.
+  readonly property real idleMinutesSet: Math.max(1, Number(setting("idleMinutes", 5)) || 5)
+  readonly property int idleLimit: Math.round(idleMinutesSet * 60)
   property int idleSeconds: 0
   // Whether the hidden "music" workspace (the app window) is on screen right
   // now, so the cover button can say "Hide app" instead of "Show app".
