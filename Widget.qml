@@ -415,7 +415,7 @@ Panel {
   // without it. Under auth that probe is refused (the app accepts the socket,
   // then closes it with 1008), so a token that arrives while the app is not up
   // probes again at once instead of at the next 20 s tick.
-  onApiTokenChanged: { if (!appUp) probe(); wakeIfSetUp() }
+  onApiTokenChanged: { tokenRejected = false; tokenRefusals = 0; if (!appUp) probe(); wakeIfSetUp() }
   FileView {
     id: tokenFile
     path: root.stateDir + "/token"
@@ -566,9 +566,9 @@ Panel {
     // Not installed or not set up: nothing to start yet. The panel says what
     // to do; a play from the bar says so in a toast. Setup itself wakes the
     // app through here to mint its token, so it is let through.
-    if (!setupRunning && !appUp && (!appInstalled || needsSetup)) {
-      if (action === "play") toastFor(appInstalled ? "YouTube Music isn't set up yet. Open the panel to set it up."
-        : "YouTube Music isn't installed yet. Open the panel to install it.", 5000)
+    if (!setupRunning && !appUp && (!appInstalled || needsSetup || tokenRejected)) {
+      if (action === "play") toastFor(!appInstalled ? "YouTube Music isn't installed yet. Open the panel to install it."
+        : tokenRejected ? tokenRejectedText : "YouTube Music isn't set up yet. Open the panel to set it up.", 5000)
       return
     }
     if (action === "play") pendingAction = "play"
@@ -585,7 +585,7 @@ Panel {
     id: launchTimer
     interval: 600
     // Through the bridge, so the app runs with the private pipe and no port.
-    onTriggered: if (!root.appUp && !launcher.running) launcher.running = true
+    onTriggered: if (!root.appUp && !launcher.running) { root.launchedApp = true; launcher.running = true }
   }
   // The bridge runs in a session of its own (setsid), so a shell restart never
   // takes the app down, as with the `setsid -f` this replaces. But that gave
@@ -1144,6 +1144,9 @@ Panel {
         // auth refusing it, 1008): find out whose it is before the token goes.
         if (!wasUp && root.liveAnswered && !root.liveWithToken && root.apiToken !== "" && !root.portTrusted)
           root.checkPortOwner()
+        // The app took a socket that carried the token and closed it before
+        // saying anything: it turned the token down.
+        else if (!wasUp && root.liveAnswered && root.liveWithToken) root.tokenRefused()
         // No retry.restart() here. This handler runs outside the timer's own
         // tick, and restart() re-arms triggeredOnStart, so every refused
         // connect queued the next one at once: about 44,000 connects a second
@@ -1312,6 +1315,9 @@ Panel {
 
   function markUp() {
     appUp = true
+    tokenRefusals = 0
+    tokenRejected = false
+    launchedApp = false
     checkApiLock()
     starting = false
     startFailed = false
@@ -1326,10 +1332,11 @@ Panel {
   }
   function probe() {
     // A token file written while the shell runs (nic-ytm-lock) is not always
-    // seen by the watch, so look again on each probe while there is none.
-    if (!apiToken) tokenFile.reload()
+    // seen by the watch, so look again on each probe while there is none
+    // (or while the app turns the one we have down).
+    if (!apiToken || tokenRejected) tokenFile.reload()
     if (live.status === WebSocket.Open || live.status === WebSocket.Connecting) return
-    var tok = apiToken !== "" && portTrusted
+    var tok = apiToken !== "" && portTrusted && !tokenRejected
     live.active = false
     liveWithToken = tok
     liveAnswered = false
@@ -1353,6 +1360,33 @@ Panel {
   property bool liveWithToken: false
   property bool liveAnswered: false
   function checkPortOwner() { if (!portCheck.running) portCheck.running = true }
+
+  // The app turns the token down (its settings were reset, or another setup
+  // minted a new one): it accepts each socket with the token and closes it
+  // at once (1008). The panel waited out the 40 s start timeout and then said
+  // "didn't start", and the app it had started kept running unused (deep
+  // review 2026-10-01). Two refusals in a row (one can be the app quitting
+  // just then) now stop the start, quit the app if this widget started it,
+  // and show the Set up screen with what to do. Probes then go without the
+  // token until the token file changes.
+  property bool tokenRejected: false
+  property int tokenRefusals: 0
+  // This wake launched the bridge, so the app is this widget's to quit.
+  property bool launchedApp: false
+  function tokenRefused() {
+    if (setupRunning) return
+    tokenRefusals += 1
+    if (tokenRefusals < 2 || tokenRejected) return
+    tokenRejected = true
+    if (starting) {
+      startTimeout.stop()
+      starting = false
+      pendingAction = ""
+    }
+    if (launchedApp) { launchedApp = false; quitApp() }
+    if (!opened) toastFor(tokenRejectedText, 8000)
+  }
+  readonly property string tokenRejectedText: "YouTube Music turned down this widget's key. Open the panel and run Set up again."
   function portOwnedByMe(t) {
     var ls = String(t || "").split("\n").map(function(l) { return l.trim() }).filter(function(l) { return l !== "" })
     if (ls.length < 2 || !/^[0-9]+$/.test(ls[0])) return false
@@ -2722,7 +2756,7 @@ Panel {
   property bool setupRunning: false
   property string setupError: ""
   readonly property bool needsSetup: appInstalled && tokenChecked && apiToken === "" && !appUp
-  readonly property bool setupScreen: !appInstalled || needsSetup || setupRunning
+  readonly property bool setupScreen: !appInstalled || needsSetup || setupRunning || (tokenRejected && !appUp)
   function checkInstalled() { if (!installCheck.running) installCheck.running = true }
   Process {
     id: installCheck
@@ -3284,7 +3318,8 @@ Panel {
           textFormat: Text.PlainText
           text: !root.appInstalled ? "YouTube Music isn't installed"
             : root.setupRunning ? "Setting up YouTube Music…"
-            : root.setupError !== "" ? "Setup didn't finish" : "One step before it works"
+            : root.setupError !== "" ? "Setup didn't finish"
+            : root.tokenRejected ? "Run Set up again" : "One step before it works"
           color: root.fg
           font.family: root.fontFamily
           font.pixelSize: Style.font.subtitle
@@ -3299,6 +3334,7 @@ Panel {
             ? "This widget is a remote for the YouTube Music desktop app (pear-desktop). Install opens a terminal where yay installs pear-desktop-bin from the AUR and asks you to confirm. This screen moves on by itself when it's done."
             : root.setupRunning ? "The app starts and quits once while this runs. It takes about half a minute."
             : root.setupError !== "" ? root.setupError
+            : root.tokenRejected ? "The app turned down this widget's key, so the widget can't control it. Its settings may have been reset. Set up gives the widget a new key."
             : "Set up turns on the app's local API and locks it to this widget with a private token, turns off the app's tray and start-at-login, and adds a YouTube Music menu entry. It doesn't touch anything else. Sign in inside the app afterwards if it asks."
           color: root.a(root.fg, 0.6)
           font.family: root.fontFamily
