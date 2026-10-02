@@ -38,13 +38,20 @@ set -euo pipefail
 cfg="$HOME/.config/YouTube Music/config.json"
 tok="$HOME/.local/state/omarchy/nic-youtube-music/token"
 api=http://127.0.0.1:26538
-app="/opt/YouTube Music/youtube-music"
+here=$(cd "$(dirname "$0")" && pwd)
+# The app's executable, and for the source package (pear-desktop, on the
+# system Electron) its app.asar: tools/cdp-bridge --which knows both packages.
+# Neither installed: match the bin package's path, which finds nothing.
+{ read -r app; read -r app_asar; } < <("$here/cdp-bridge" --which 2>/dev/null || printf '%s\n\n' "/opt/YouTube Music/youtube-music")
 # The app's main process: the one without --type= (the rest are its helpers).
-# Its flags differ by how it was started, so match the path alone.
+# Its flags differ by how it was started, so match the executable's path, and
+# for the source package the app.asar too (other apps share that Electron).
 app_pids() {
-  local p
+  local p cmd
   for p in $(pgrep -f "^$app" || true); do
-    tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -q -- '--type=' || echo "$p"
+    cmd=$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null) || continue
+    [[ $cmd == *--type=* ]] && continue
+    [[ -z $app_asar || $cmd == *" $app_asar "* ]] && echo "$p"
   done
 }
 app_running() { [[ -n $(app_pids) ]]; }

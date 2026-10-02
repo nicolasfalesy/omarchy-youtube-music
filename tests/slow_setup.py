@@ -109,3 +109,20 @@ class SetupTest(Case):
         with open(victim) as f:
             self.assertEqual(f.read(), "{}\n")
         self.assertFalse(os.path.islink(real))
+
+    def test_sets_up_the_source_package_too(self):
+        self.use_source_package()
+        self.profile()
+        self.bridge_up()
+        rc, out, err = self.setup_run()
+        self.assertEqual(rc, 0, err)
+        self.assert_set_up()
+
+    def test_source_package_flags_lose_their_debugging_lines(self):
+        self.use_source_package()
+        self.profile()
+        flags = self.write_flags("--enable-features=X\n--inspect=127.0.0.1:9229\n", name="pear-flags.conf")
+        rc, _, err = self.setup_run()
+        self.assertEqual(rc, 0, err)
+        with open(flags) as f:
+            self.assertEqual(f.read(), "--enable-features=X\n")

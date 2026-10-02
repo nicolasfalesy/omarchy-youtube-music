@@ -242,3 +242,20 @@ class LockApiTest(Case):
         self.assertIn("does not work", err)
         self.assertFalse(os.path.lexists(self.token_path()))
         self.assert_locked_on_disk()
+
+    def test_locks_the_source_package_too(self):
+        _, asar = self.use_source_package()
+        self.config()
+        rc, out, err = self.lock()
+        self.assertEqual(rc, 0, err)
+        self.assertIn("Locked:", out)
+        self.assertIn(asar, self.app_events("start")[0]["argv"])
+        self.assertEqual(len(self.app_events("quit")), 1)
+
+    def test_a_source_package_app_that_will_not_quit_is_found_and_killed(self):
+        self.use_source_package()
+        self.config()
+        self.ctl_on("noquit")
+        rc, out, err = self.lock(timeout=120)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("Locked:", out)

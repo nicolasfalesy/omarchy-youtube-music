@@ -5,7 +5,8 @@ Sets up the namespace, then runs the tests in a child and reaps every orphan
 (the tools start things with setsid -f, and orphans land here):
   - loopback up, so the fake app can serve 127.0.0.1:26538 in here only;
   - a tmpfs on /opt with the fake app at /opt/YouTube Music/youtube-music,
-    the path tools/cdp-bridge, tools/setup and tools/lock-api use;
+    the path the tools use for pear-desktop-bin; a real pear-desktop
+    (source package) launcher and app folder are hidden;
   - /dev/log bound to a test socket; a child copies what arrives into
     $YTM_SCRATCH/syslog.log, so tests can read what a tool sent to the journal
     and nothing reaches the real one.
@@ -41,6 +42,16 @@ def loopback_up():
     flags = struct.unpack("16sH14x", fcntl.ioctl(s, 0x8913, ifr))[1]  # SIOCGIFFLAGS
     fcntl.ioctl(s, 0x8914, struct.pack("16sH14x", b"lo", flags | 1))  # SIOCSIFFLAGS, IFF_UP
     s.close()
+
+
+def hide_real_apps():
+    """The source package (pear-desktop) runs on a system Electron: hide its
+    launcher and app folder if installed, so no test can ever start it."""
+    for path in ("/usr/bin/pear-desktop", "/usr/bin/youtube-music"):
+        if os.path.exists(path):
+            mount("/dev/null", path, None, MS_BIND)
+    if os.path.isdir("/usr/lib/pear-desktop"):
+        mount("tmpfs", "/usr/lib/pear-desktop", "tmpfs", 0, "mode=755")
 
 
 def fake_app_at_opt():
@@ -88,6 +99,7 @@ def main():
     sep = sys.argv.index("--")
     patterns, names = sys.argv[1:sep], sys.argv[sep + 1:]
     loopback_up()
+    hide_real_apps()
     fake_app_at_opt()
     os.environ["YTM_SINK_PID"] = str(syslog_sink())
     child = os.fork()
@@ -96,6 +108,13 @@ def main():
         sys.stdout.flush()
         sys.stderr.flush()
         os._exit(code)
+    # PID 1 of a namespace ignores signals it has no handler for, so a Ctrl+C
+    # or a kill of tests/run would leave the namespace running: stop it all.
+    def stop(signum, _frame):
+        os.kill(-1, signal.SIGKILL)
+        os._exit(128 + signum)
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, stop)
     code = 1
     while True:
         try:

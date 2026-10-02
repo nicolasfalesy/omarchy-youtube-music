@@ -28,9 +28,18 @@
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
-app="/opt/YouTube Music/youtube-music"
+# The app's executable, and for the source package its app.asar (see
+# tools/cdp-bridge: pear-desktop-bin and pear-desktop both work).
+if ! { read -r app; read -r app_asar; } < <("$here/cdp-bridge" --which 2>/dev/null); then
+  app="" app_asar=""
+fi
 cfg="$HOME/.config/YouTube Music/config.json"
-flags="${XDG_CONFIG_HOME:-$HOME/.config}/youtube-music-flags.conf"
+# The flags file of the package's own launcher.
+if [[ -n $app_asar ]]; then
+  flags="${XDG_CONFIG_HOME:-$HOME/.config}/pear-flags.conf"
+else
+  flags="${XDG_CONFIG_HOME:-$HOME/.config}/youtube-music-flags.conf"
+fi
 apps="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
 entry="$apps/com.github.th-ch.youtube-music.desktop"
 
@@ -56,15 +65,19 @@ replace_with() {
 # rule as tools/cdp-bridge, which also drops them at every start.
 debug_switch='(^|[[:space:]])--?(remote[-_]debugging[-_]|inspect)'
 strip_debug_flags() { grep -Eiv -- "$debug_switch" "$flags" || true; }
+# The app's main process: no --type= (those are its helpers), and for the
+# source package the app.asar on its command line (other apps share Electron).
 app_running() {
-  local p
+  local p cmd
   for p in $(pgrep -f "^$app" || true); do
-    tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -q -- '--type=' || return 0
+    cmd=$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null) || continue
+    [[ $cmd == *--type=* ]] && continue
+    [[ -z $app_asar || $cmd == *" $app_asar "* ]] && return 0
   done
   return 1
 }
 
-[[ -x $app ]] || { say "YouTube Music (pear-desktop) is not installed. Install it first:  yay -S pear-desktop-bin" >&2; exit 1; }
+[[ -n $app ]] || { say "YouTube Music (pear-desktop) is not installed. Install it first:  yay -S pear-desktop  (or pear-desktop-bin)" >&2; exit 1; }
 for tool in jq curl openssl python3; do
   command -v "$tool" >/dev/null || { say "Missing $tool." >&2; exit 1; }
 done

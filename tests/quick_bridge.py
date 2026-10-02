@@ -4,7 +4,7 @@ import stat
 import subprocess
 import time
 
-from ytmtest import Case, Conn, wait_until
+from ytmtest import TOOLS, Case, Conn, wait_until
 
 
 def switches(pid):
@@ -280,6 +280,53 @@ class BridgeTest(Case):
         os.kill(self.app_events("start")[0]["pid"], 9)
         self.assertEqual(p.wait(timeout=2), 0)
         self.assertFalse(os.path.exists(self.sock))
+
+
+class SourcePackageTest(Case):
+    """The AUR source package pear-desktop: /usr/bin/pear-desktop runs the
+    system electronNN on /usr/lib/pear-desktop/app.asar. The bridge starts
+    that Electron itself (its /usr/bin/electronNN wrapper would pass its own
+    flags files on unfiltered), in the same argument order, and filters
+    every flags file the two launchers read."""
+
+    def test_starts_the_system_electron_on_the_app(self):
+        exe, asar = self.use_source_package()
+        self.write_flags("--ozone-platform=wayland\n# a comment\n--inspect=127.0.0.1:9229\n  -remote-debugging-port=9\n",
+                         name="electron42-flags.conf")
+        self.write_flags("--enable-features=X --remote-debugging-port=9222\n--inspect-brk\n", name="pear-flags.conf")
+        self.write_flags("--only-for-the-bin-package\n")
+        self.bridge_up("music://x")
+        start = self.app_events("start")[0]
+        self.assertEqual(start["argv"], ["--ozone-platform=wayland", asar, "--enable-features=X",
+                                         "--remote-debugging-pipe", "music://x"])
+        self.assertIn("ELECTRON_FORCE_IS_PACKAGED", start["env"])
+        c = Conn(self.sock)
+        c.send({"id": 1, "method": "Browser.close"})
+        self.assertEqual(c.recv()["id"], 1)
+
+    def test_falls_back_to_the_shared_electron_flags_file(self):
+        _, asar = self.use_source_package(electron="electron43")
+        self.write_flags("--from-the-shared-file\n", name="electron-flags.conf")
+        self.bridge_up()
+        self.assertEqual(self.app_events("start")[0]["argv"], ["--from-the-shared-file", asar, "--remote-debugging-pipe"])
+
+    def test_which_names_the_installed_app(self):
+        r = subprocess.run([os.path.join(TOOLS, "cdp-bridge"), "--which"], env=self.env, capture_output=True, text=True, timeout=5)
+        self.assertEqual((r.returncode, r.stdout), (0, "/opt/YouTube Music/youtube-music\n\n"))
+        exe, asar = self.use_source_package()
+        r = subprocess.run([os.path.join(TOOLS, "cdp-bridge"), "--which"], env=self.env, capture_output=True, text=True, timeout=5)
+        self.assertEqual((r.returncode, r.stdout), (0, exe + "\n" + asar + "\n"))
+
+    def test_nothing_installed_is_said_plainly(self):
+        self.use_source_package()
+        os.remove(self.env["NIC_YTM_LAUNCHER"])
+        before = len(self.syslog_lines())
+        p = self.start_bridge()
+        self.assertEqual(p.wait(timeout=5), 1)
+        with open(p.errfile) as f:
+            self.assertIn("not installed", f.read())
+        self.assertEqual(self.app_events("start"), [])
+        self.assertTrue(wait_until(lambda: any("not installed" in l for l in self.syslog_lines()[before:]), 2))
 
 
 def race_once(case):

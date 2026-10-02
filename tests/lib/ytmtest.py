@@ -84,10 +84,16 @@ class Case(unittest.TestCase):
             "FAKE_LOG": self.applog,
             "FAKE_CTL": self.ctl,
             "YTM_TOOLS": TOOLS,
+            # The source package's launcher: absent unless a test sets one up.
+            "NIC_YTM_LAUNCHER": os.path.join(self.dir, "no-launcher"),
         }
+        self.hidden_bin = None
         self.procs = []
 
     def tearDown(self):
+        if self.hidden_bin:
+            os.rename(self.hidden_bin + ".hidden", self.hidden_bin)
+            self.hidden_bin = None
         keep = {1, os.getpid(), int(os.environ["YTM_SINK_PID"])}
         for name in os.listdir("/proc"):
             if name.isdigit() and int(name) not in keep:
@@ -102,6 +108,32 @@ class Case(unittest.TestCase):
                 pass
 
     # --- helpers ---
+    def use_source_package(self, electron="electron42"):
+        """Make the app look like the AUR source package pear-desktop: a
+        launcher /usr/bin/pear-desktop that runs a system Electron on
+        /usr/lib/pear-desktop/app.asar (here under the test folder), and no
+        pear-desktop-bin. Returns (electron binary, app.asar)."""
+        root = os.path.join(self.dir, "usrlib")
+        exe = os.path.join(root, electron, "electron")
+        asar = os.path.join(root, "pear-desktop", "app.asar")
+        os.makedirs(os.path.dirname(exe))
+        os.makedirs(os.path.dirname(asar))
+        open(asar, "w").close()
+        with open(exe, "w") as f:
+            f.write('#!/bin/bash\nexec -a "$0" python3 %s "$@"\n' % os.path.join(LIB, "fakeapp.py"))
+        os.chmod(exe, 0o755)
+        launcher = os.path.join(self.dir, "pear-desktop")
+        with open(launcher, "w") as f:  # the AUR package's pear-desktop.sh, as installed
+            f.write('#!/bin/bash\n\nXDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"\n\n'
+                    'if [[ -f "$XDG_CONFIG_HOME/pear-flags.conf" ]]; then\n'
+                    '   PEAR_USER_FLAGS="$(grep -v \'^#\' "$XDG_CONFIG_HOME/pear-flags.conf")"\nfi\n\n'
+                    'export ELECTRON_IS_DEV=0\nexec %s %s $PEAR_USER_FLAGS "$@"\n' % (electron, asar))
+        self.env["NIC_YTM_LAUNCHER"] = launcher
+        self.env["NIC_YTM_ELECTRON_ROOT"] = root
+        self.hidden_bin = "/opt/YouTube Music/youtube-music"
+        os.rename(self.hidden_bin, self.hidden_bin + ".hidden")
+        return exe, asar
+
     def ctl_on(self, name):
         open(os.path.join(self.ctl, name), "w").close()
 

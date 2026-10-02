@@ -29,7 +29,21 @@ It also refuses to pass on any switch that opens a debugging channel, from
 unauthenticated debugger on a TCP port). NODE_OPTIONS and ELECTRON_RUN_AS_NODE
 are dropped from the app's environment for the same reason.
 
+Both AUR packages of the app work. pear-desktop-bin is a bundled binary,
+/opt/YouTube Music/youtube-music, whose launcher reads
+~/.config/youtube-music-flags.conf. pear-desktop (built from source) runs
+Arch's system Electron: /usr/bin/pear-desktop reads ~/.config/pear-flags.conf
+and runs `electronNN /usr/lib/pear-desktop/app.asar <flags>`, and
+/usr/bin/electronNN adds the lines of ~/.config/electronNN-flags.conf (or
+electron-flags.conf) in front. The bridge starts /usr/lib/electronNN/electron
+itself in that same order, so every one of those files goes through the same
+filter (the wrapper would pass them on unfiltered). Both packages run the
+same app code, so the window class and the profile folder are the same.
+
 Usage: cdp-bridge [extra app arguments...]
+       cdp-bridge --which   prints the app's executable and, for the source
+                            package, its app.asar (an empty line otherwise);
+                            exits 1 when neither package is installed
 Started by the widget when the app is needed, and by the app's menu entry
 (tools/setup installs one), so the app is never started with an open port.
 """
@@ -48,9 +62,11 @@ import syslog
 import time
 from urllib.parse import urlsplit
 
-APP = os.environ.get("NIC_YTM_APP", "/opt/YouTube Music/youtube-music")
-FLAGS_FILE = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
-                          "youtube-music-flags.conf")
+CONFIG = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+BIN_APP = "/opt/YouTube Music/youtube-music"  # pear-desktop-bin
+# pear-desktop (source build). The NIC_YTM_* names exist for the tests.
+LAUNCHER = os.environ.get("NIC_YTM_LAUNCHER", "/usr/bin/pear-desktop")
+ELECTRON_ROOT = os.environ.get("NIC_YTM_ELECTRON_ROOT", "/usr/lib")
 # The biggest one message may be, either way. Real answers are a few MB (the
 # library); without a cap a peer could make the bridge buffer without end.
 # An answer over it is dropped and its asker gets a CDP error instead; a
@@ -112,10 +128,10 @@ def opens_debugging(word):
     return name.startswith(("remote-debugging-", "inspect"))
 
 
-def keep(words, source):
+def keep(words, source, strip=False):
     out = []
     for word in words:
-        if opens_debugging(word):
+        if opens_debugging(word.strip() if strip else word):
             say("ignoring " + word.split("=", 1)[0] + " from " + source
                 + " (the debugging channel is the private pipe)")
             continue
@@ -123,23 +139,71 @@ def keep(words, source):
     return out
 
 
-def app_argv(extra):
-    flags = []
+def find_app():
+    """(executable, app.asar or None, electron name or None) for the
+    installed app, or None. The source package wins when both are there (it
+    is the one the user chose to build)."""
+    if os.environ.get("NIC_YTM_APP"):
+        return os.environ["NIC_YTM_APP"], None, None
     try:
-        with open(FLAGS_FILE, encoding="utf-8") as f:
+        with open(LAUNCHER, encoding="utf-8", errors="replace") as f:
+            text = f.read(65536)
+    except OSError:
+        text = ""
+    m = re.search(r"^\s*exec\s+(electron\d+)\s+(/\S+\.asar)(\s|$)", text, re.M)
+    if m:
+        exe = os.path.join(ELECTRON_ROOT, m.group(1), "electron")
+        if os.access(exe, os.X_OK) and os.path.isfile(m.group(2)):
+            return exe, m.group(2), m.group(1)
+    if os.access(BIN_APP, os.X_OK):
+        return BIN_APP, None, None
+    return None
+
+
+def flag_words(name):
+    """A launcher's flags file read the way pear's launchers do: lines not
+    starting with #, split on whitespace."""
+    path = os.path.join(CONFIG, name)
+    words = []
+    try:
+        with open(path, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                flags += keep(line.split(), FLAGS_FILE)
+                if line and not line.startswith("#"):
+                    words += keep(line.split(), path)
     except OSError:
         pass
+    return words
+
+
+def flag_lines(electron):
+    """Arch's /usr/bin/electronNN wrapper: one flag per line, from
+    electronNN-flags.conf, or electron-flags.conf when that is missing."""
+    for name in (electron + "-flags.conf", "electron-flags.conf"):
+        path = os.path.join(CONFIG, name)
+        try:
+            with open(path, encoding="utf-8") as f:
+                lines = [line.rstrip("\n") for line in f]
+        except OSError:
+            continue
+        return keep([ln for ln in lines if ln.strip() and not re.match(r"\s*#", ln)], path, strip=True)
+    return []
+
+
+def app_argv(app, extra):
+    exe, asar, electron = app
     # The menu entry's %U lands in extra: filtered the same way.
-    return [APP] + flags + ["--remote-debugging-pipe"] + keep(extra, "the command line")
+    tail = ["--remote-debugging-pipe"] + keep(extra, "the command line")
+    if asar is None:  # pear-desktop-bin: /usr/bin/youtube-music's order
+        return [exe] + flag_words("youtube-music-flags.conf") + tail
+    # pear-desktop: /usr/bin/electronNN's flags, the app, then pear's flags.
+    return [exe] + flag_lines(electron) + [asar] + flag_words("pear-flags.conf") + tail
 
 
-def app_env():
+def app_env(app):
     env = dict(os.environ, ELECTRON_IS_DEV="0")
+    if app[1] is not None:  # what /usr/bin/electronNN sets for a packaged app
+        env.setdefault("ELECTRON_FORCE_IS_PACKAGED", "true")
     # Node's own switches reach the app's main process through these too.
     for name in ("NODE_OPTIONS", "ELECTRON_RUN_AS_NODE"):
         env.pop(name, None)
@@ -227,6 +291,15 @@ def peer_uid(conn):
 
 
 def main():
+    app = find_app()
+    if sys.argv[1:] == ["--which"]:
+        if not app:
+            return 1
+        print(app[0])
+        print(app[1] or "")
+        return 0
+    if not app:
+        die("YouTube Music is not installed (AUR package pear-desktop or pear-desktop-bin)")
     d = private_dir()
     path = os.path.join(d, "cdp.sock")
 
@@ -266,8 +339,8 @@ def main():
 
     to_app_r, to_app_w = os.pipe()        # app reads commands on fd 3
     from_app_r, from_app_w = os.pipe()    # app writes answers on fd 4
-    argv = app_argv(sys.argv[1:])
-    env = app_env()
+    argv = app_argv(app, sys.argv[1:])
+    env = app_env(app)
 
     pid = os.fork()
     if pid == 0:
