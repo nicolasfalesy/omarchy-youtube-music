@@ -201,6 +201,9 @@ Panel {
   // pauses at a song's end (the video's own pause event) just before the next
   // song loads, so "was playing a moment ago" still counts for autoplay.
   property double stoppedPlayingAt: 0
+  // Set by pauseOnly(): something outside paused this widget. World Radio
+  // does that every time a station starts.
+  property bool pausedFromOutside: false
   onIsPlayingChanged: {
     if (!isPlaying) { stoppedPlayingAt = Date.now(); return }
     // One player at a time (2026-09-24: starting either one stops the
@@ -209,6 +212,18 @@ Panel {
     // only while it is actually on (its stop also forgets the current
     // station). Without that plugin the status call fails and nothing runs. One copy does it, not one
     // per monitor. The radio's side pauses this widget through pauseOnly().
+    //
+    // Not on an autoplay step: the app pauses for a moment at each song's
+    // end, and the sh, omarchy-shell and jq this spawns ran for every song
+    // (deep review 2026-10-01). While this widget played, the radio could
+    // only have started by pausing it (pauseOnly), so a start within 5 s of
+    // a stop that no outside pause caused cannot find the radio on. Calling
+    // the radio widget directly is not possible: Omarchy gives a plugin's bar
+    // API only its own widgets (bar.moduleWidgets is scoped to the plugin's
+    // own id, Bar.qml pluginBarApiFor).
+    var step = ageMs(stoppedPlayingAt) < 5000 && !pausedFromOutside
+    pausedFromOutside = false
+    if (step) return
     if (isPrimary())
       Quickshell.execDetached(["sh", "-c", "omarchy-shell nic.world-radio status | jq -e '.playing or .buffering' >/dev/null && omarchy-shell -q nic.world-radio stop"])
   }
@@ -568,6 +583,7 @@ Panel {
   // app's pauseVideo(), which does nothing on a paused or cued player.
   function pauseOnly() {
     if (!appUp) return
+    pausedFromOutside = true
     stateEpoch += 1
     pausedAt = Date.now()
     isPlaying = false
