@@ -74,3 +74,19 @@ class BridgeTest(Case):
         argv = self.app_events("start")[0]["argv"]
         self.assertEqual(argv, ["--ozone-platform=wayland", "--enable-features=Foo",
                                 "--remote-debugging-pipe", "music://x"])
+
+    def test_debugging_switches_never_reach_the_app(self):
+        # Electron honours Node's --inspect* in this build (its NodeCliInspect
+        # fuse is on), which opens an unauthenticated debugger on a TCP port.
+        # Chromium also reads switches with one dash, and Node reads "_" as "-".
+        self.write_flags("--ozone-platform=wayland\n--inspect=127.0.0.1:9229\n--inspect-brk\n"
+                         "--inspect-port=9230 --inspect_brk=1\n-remote-debugging-port=9222\n"
+                         "--remote-debugging-address=0.0.0.0\n--remote-debugging-pipe\n")
+        self.bridge_up("--inspect-brk-node", "--remote-debugging-port=9333", "music://ok")
+        argv = self.app_events("start")[0]["argv"]
+        self.assertEqual(argv, ["--ozone-platform=wayland", "--remote-debugging-pipe", "music://ok"])
+
+    def test_node_environment_switches_are_dropped(self):
+        env = dict(self.env, NODE_OPTIONS="--inspect=127.0.0.1:9229", ELECTRON_RUN_AS_NODE="1")
+        self.bridge_up(env=env)
+        self.assertEqual(sorted(self.app_events("start")[0]["env"]), ["ELECTRON_IS_DEV"])

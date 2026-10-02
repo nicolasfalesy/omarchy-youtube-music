@@ -130,8 +130,9 @@ class Case(unittest.TestCase):
 
     def bridge_up(self, *args, **kw):
         p = self.start_bridge(*args, **kw)
-        self.assertTrue(wait_until(lambda: os.path.exists(self.sock) and self.app_events("start")),
-                        "the bridge did not start the app and serve its socket")
+        if not wait_until(lambda: os.path.exists(self.sock) and self.app_events("start")):
+            with open(p.errfile, errors="replace") as f:
+                self.fail("the bridge did not start the app and serve its socket; its stderr:\n" + f.read()[-2000:])
         return p
 
     def config_path(self):

@@ -17,9 +17,12 @@ $XDG_RUNTIME_DIR/nic-youtube-music/cdp.sock: the folder is 0700 and the socket
 Framing: the pipe separates messages with a NUL byte; the socket uses a
 newline, which JSON text never contains raw, so the widget can split lines.
 
-It also refuses to pass on any --remote-debugging-* flag from
-~/.config/youtube-music-flags.conf, so a leftover port line from an older setup
-cannot reopen the port.
+It also refuses to pass on any switch that opens a debugging channel, from
+~/.config/youtube-music-flags.conf or its own arguments: --remote-debugging-*
+(a leftover port line from an older setup cannot reopen the port) and Node's
+--inspect* (Electron honours those in the app's build and opens an
+unauthenticated debugger on a TCP port). NODE_OPTIONS and ELECTRON_RUN_AS_NODE
+are dropped from the app's environment for the same reason.
 
 Usage: cdp-bridge [extra app arguments...]
 Started by the widget when the app is needed, and by the app's menu entry
@@ -67,6 +70,27 @@ def private_dir():
     return d
 
 
+def opens_debugging(word):
+    """True for a switch that opens a debugging channel. Chromium also reads
+    switches written with one dash, and Node reads "_" as "-" in its own, so
+    the name is compared with both spellings folded."""
+    if not word.startswith("-"):
+        return False
+    name = word.lstrip("-").split("=", 1)[0].replace("_", "-").lower()
+    return name.startswith(("remote-debugging-", "inspect"))
+
+
+def keep(words, source):
+    out = []
+    for word in words:
+        if opens_debugging(word):
+            print("cdp-bridge: ignoring " + word.split("=", 1)[0] + " from " + source
+                  + " (the debugging channel is the private pipe)", file=sys.stderr)
+            continue
+        out.append(word)
+    return out
+
+
 def app_argv(extra):
     flags = []
     try:
@@ -75,15 +99,19 @@ def app_argv(extra):
                 line = line.strip()
                 if not line or line.startswith("#"):
                     continue
-                for word in line.split():
-                    if word.startswith("--remote-debugging-"):
-                        print("cdp-bridge: ignoring " + word + " from " + FLAGS_FILE
-                              + " (the debugging channel is the private pipe)", file=sys.stderr)
-                        continue
-                    flags.append(word)
+                flags += keep(line.split(), FLAGS_FILE)
     except OSError:
         pass
-    return [APP] + flags + ["--remote-debugging-pipe"] + list(extra)
+    # The menu entry's %U lands in extra: filtered the same way.
+    return [APP] + flags + ["--remote-debugging-pipe"] + keep(extra, "the command line")
+
+
+def app_env():
+    env = dict(os.environ, ELECTRON_IS_DEV="0")
+    # Node's own switches reach the app's main process through these too.
+    for name in ("NODE_OPTIONS", "ELECTRON_RUN_AS_NODE"):
+        env.pop(name, None)
+    return env
 
 
 def peer_uid(conn):
@@ -108,7 +136,7 @@ def main():
     to_app_r, to_app_w = os.pipe()        # app reads commands on fd 3
     from_app_r, from_app_w = os.pipe()    # app writes answers on fd 4
     argv = app_argv(sys.argv[1:])
-    env = dict(os.environ, ELECTRON_IS_DEV="0")
+    env = app_env()
 
     pid = os.fork()
     if pid == 0:
