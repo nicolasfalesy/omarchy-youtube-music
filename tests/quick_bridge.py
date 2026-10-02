@@ -1,0 +1,76 @@
+"""tools/cdp-bridge against the fake app: no GUI, no network, seconds."""
+import os
+import stat
+import subprocess
+import time
+
+from ytmtest import Case, Conn, wait_until
+
+
+class BridgeTest(Case):
+    def test_relay_each_answer_goes_to_the_connection_that_asked(self):
+        self.bridge_up()
+        a, b = Conn(self.sock), Conn(self.sock)
+        # Both widget copies count their ids from 1.
+        a.send({"id": 1, "method": "Runtime.evaluate", "sessionId": "S1", "params": {"expression": "1"}})
+        b.send({"id": 1, "method": "Target.getTargets", "params": {}})
+        ra, rb = a.recv(), b.recv()
+        self.assertEqual((ra["id"], ra["result"]), (1, {"echo": "Runtime.evaluate"}))
+        self.assertEqual(rb["id"], 1)
+        self.assertIn("targetInfos", rb["result"])
+
+    def test_events_go_to_every_connection(self):
+        self.bridge_up()
+        a, b = Conn(self.sock), Conn(self.sock)
+        b.send({"id": 7, "method": "Target.getTargets", "params": {}})
+        b.recv()  # b is registered before the event
+        a.send({"id": 1, "method": "Fake.event"})
+        got_a = [a.recv(), a.recv()]
+        self.assertIn({"method": "Fake.event", "params": {}}, got_a)
+        self.assertEqual(b.recv(), {"method": "Fake.event", "params": {}})
+
+    def test_socket_and_folder_are_private(self):
+        self.bridge_up()
+        self.assertEqual(stat.S_IMODE(os.stat(self.sock).st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(os.stat(os.path.dirname(self.sock)).st_mode), 0o700)
+
+    def test_refuses_a_shared_runtime_folder(self):
+        os.chmod(self.rt, 0o755)
+        p = self.start_bridge()
+        self.assertEqual(p.wait(timeout=5), 1)
+        self.assertEqual(self.app_events("start"), [])
+
+    def test_second_bridge_leaves_the_running_one_alone(self):
+        self.bridge_up()
+        second = self.start_bridge()
+        self.assertEqual(second.wait(timeout=5), 0)
+        time.sleep(0.3)
+        self.assertEqual(len(self.app_events("start")), 1)
+        c = Conn(self.sock)
+        c.send({"id": 1, "method": "Target.getTargets", "params": {}})
+        self.assertEqual(c.recv()["id"], 1)
+
+    def test_stale_socket_from_a_dead_bridge_is_replaced(self):
+        os.mkdir(os.path.dirname(self.sock), 0o700)
+        import socket as s
+        dead = s.socket(s.AF_UNIX, s.SOCK_STREAM)
+        dead.bind(self.sock)
+        dead.close()  # the file stays, nothing listens
+        self.bridge_up()
+        c = Conn(self.sock)
+        c.send({"id": 3, "method": "Target.getTargets", "params": {}})
+        self.assertEqual(c.recv()["id"], 3)
+
+    def test_browser_close_quits_the_app_and_the_bridge(self):
+        p = self.bridge_up()
+        Conn(self.sock).send({"id": 1, "method": "Browser.close", "params": {}})
+        self.assertEqual(p.wait(timeout=10), 0)
+        self.assertEqual([e["why"] for e in self.app_events("quit")], ["Browser.close"])
+        self.assertFalse(os.path.exists(self.sock), "the socket is removed on exit")
+
+    def test_app_arguments_keep_ordinary_flags(self):
+        self.write_flags("# a comment\n--ozone-platform=wayland\n\n--enable-features=Foo\n")
+        self.bridge_up("music://x")
+        argv = self.app_events("start")[0]["argv"]
+        self.assertEqual(argv, ["--ozone-platform=wayland", "--enable-features=Foo",
+                                "--remote-debugging-pipe", "music://x"])

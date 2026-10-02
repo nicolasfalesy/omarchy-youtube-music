@@ -1,0 +1,20 @@
+#!/bin/bash
+# Test stand-in for omarchy-shell, first in PATH inside the test namespace.
+# Only what the tools call: "-q nic.youtube-music quit|wake".
+#   wake: what the widget does, start the app through tools/cdp-bridge.
+#   quit: what the widget does, Browser.close over the bridge's socket.
+# $FAKE_CTL/shell_noquit or shell_nowake make the "widget" ignore that call.
+for arg in "$@"; do
+  case $arg in
+    quit)
+      [[ -e $FAKE_CTL/shell_noquit ]] && exit 0
+      sock=$XDG_RUNTIME_DIR/nic-youtube-music/cdp.sock
+      [[ -S $sock ]] && python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.settimeout(2); s.connect(sys.argv[1]); s.sendall(b"{\"id\":1,\"method\":\"Browser.close\"}\n")' "$sock" 2>/dev/null
+      ;;
+    wake)
+      [[ -e $FAKE_CTL/shell_nowake ]] && exit 0
+      setsid -f "$YTM_TOOLS/cdp-bridge" </dev/null >/dev/null 2>>"$FAKE_CTL/bridge.err"
+      ;;
+  esac
+done
+exit 0

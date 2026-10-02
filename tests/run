@@ -1,0 +1,58 @@
+#!/bin/bash
+# tests/run [--quick] [test names...]: the plugin's test suite.
+#
+#   tests/run           every test: quick_*.py, then slow_*.py (setup and
+#                       lock-api runs against a fake app, the 30-run start race)
+#   tests/run --quick   only tests/quick_*.py: no GUI, no network, a few seconds
+#   tests/run quick_bridge.BridgeTest.test_relay   one test (module.Class.test)
+#
+# Every test runs inside private user, network, mount and PID namespaces
+# (unshare), with an empty environment (env -i) plus a scratch HOME, XDG
+# folders and TMPDIR. So no test can see or signal the real YouTube Music app
+# (its processes are in another PID namespace), reach its API port (the
+# namespace has its own loopback, so the fake app can take 127.0.0.1:26538),
+# touch its profile or the user's settings (HOME is a scratch folder), write to
+# the real journal (/dev/log is a test socket in there), or draw on the screen
+# (no display variables). The app itself is a stand-in, tests/lib/fakeapp.py,
+# mounted at the real app's paths inside the namespace only.
+#
+# Needs: bash, python3, jq, curl, openssl, and unprivileged user namespaces.
+# The static checks also run shellcheck when it is installed.
+set -euo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+repo=${here%/tests}
+
+patterns=(quick_*.py slow_*.py)
+if [[ ${1:-} == --quick ]]; then
+  patterns=(quick_*.py)
+  shift
+fi
+
+for tool in python3 jq curl openssl unshare; do
+  command -v "$tool" >/dev/null || { echo "tests/run: $tool is missing; nothing was run." >&2; exit 2; }
+done
+if ! unshare -rnmpf --mount-proc true 2>/dev/null; then
+  echo "tests/run: unprivileged user namespaces are off (unshare -rnmpf failed); nothing was run." >&2
+  exit 2
+fi
+
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/ytm-tests.XXXXXXXX")
+trap 'rm -rf -- "$scratch"' EXIT
+mkdir -p -- "$scratch/home" "$scratch/tmp"
+mkdir -m 700 -- "$scratch/rt"
+
+env -i \
+  PATH=/usr/local/bin:/usr/bin:/bin \
+  LANG=C.UTF-8 \
+  HOME="$scratch/home" \
+  TMPDIR="$scratch/tmp" \
+  XDG_RUNTIME_DIR="$scratch/rt" \
+  XDG_CONFIG_HOME="$scratch/home/.config" \
+  XDG_DATA_HOME="$scratch/home/.local/share" \
+  XDG_CACHE_HOME="$scratch/home/.cache" \
+  XDG_STATE_HOME="$scratch/home/.local/state" \
+  PYTHONDONTWRITEBYTECODE=1 \
+  YTM_REPO="$repo" \
+  YTM_SCRATCH="$scratch" \
+  unshare -rnmpf --mount-proc --kill-child \
+  python3 "$here/lib/nsinit.py" "${patterns[@]}" -- "$@"
