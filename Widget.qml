@@ -250,6 +250,9 @@ Panel {
   property var pageHeader: null
   property bool loading: false
   property string listError: ""
+  // listError is a failure (the page did not answer, a search failed), not
+  // an empty page or a "sign in" note: the list area then offers Try again.
+  property bool listFailed: false
   property bool signedIn: true
   // The whole queue and the next songs, both from one page snapshot
   // (loadQueue), so the Queue tab and Up next always agree.
@@ -2477,10 +2480,18 @@ Panel {
     // Nothing to browse on the Queue tab. Drop any Home or Library load still
     // in flight and its error, so "The queue is empty." is not replaced by
     // another tab's message.
-    else if (view === "queue") { serial += 1; loading = false; loadingMore = false; moreToken = ""; listError = "" }
-    else if (view === "lyrics") { serial += 1; loading = false; loadingMore = false; moreToken = ""; listError = ""; loadLyrics() }
+    else if (view === "queue") { serial += 1; loading = false; loadingMore = false; moreToken = ""; listError = ""; listFailed = false }
+    else if (view === "lyrics") { serial += 1; loading = false; loadingMore = false; moreToken = ""; listError = ""; listFailed = false; loadLyrics() }
     else if (view === "library") loadBrowse(libraryPage, "")
     else loadBrowse("FEmusic_home", "")
+  }
+
+  // The list area's Try again. On pear's offline page, point the page back
+  // at YouTube Music now rather than at the next 10 s retry.
+  function retryList() {
+    if (appOffline) lastPageRetry = 0
+    if (appOffline) retryAppPage()
+    refresh()
   }
 
   function loadBrowse(browseId, params) {
@@ -2491,6 +2502,7 @@ Panel {
     moreToken = ""
     moreEager = browseId === "FEmusic_home"
     listError = ""
+    listFailed = false
     // Drop the last page's header, or the back bar shows the previous album's
     // title while this one loads (and keeps it if this one fails).
     pageHeader = null
@@ -2498,7 +2510,7 @@ Panel {
       if (mine !== root.serial) return
       root.loading = false
       // Page.js answers {error: "<sentence>"} on failure (never a raw "Object").
-      if (!v || v.error) { root.listError = (v && v.error) || err || "Could not load this page."; root.setList([], "", "/browse"); return }
+      if (!v || v.error) { root.listError = (v && v.error) || err || "Could not load this page."; root.listFailed = true; root.setList([], "", "/browse"); return }
       root.pageHeader = v.header
       root.setList(v.sections || [], v.cont || "", "/browse")
       if (root.sections.length === 0) root.listError = root.signedIn ? "Nothing here yet" : "Sign in inside the YouTube Music app to see your library."
@@ -2519,11 +2531,13 @@ Panel {
     moreToken = ""
     moreEager = false
     listError = ""
+    listFailed = false
     page("window.__nicYtm.search(" + JSON.stringify(q) + "," + JSON.stringify(filter) + ")", function(v, err) {
       if (mine !== root.serial) return
       root.loading = false
       if (!v || v.error) {
         root.listError = (v && v.error) || err || "Search failed."
+        root.listFailed = true
         root.setList([], "", "/search")
         root.openFirstPending = false
         return
@@ -2673,7 +2687,7 @@ Panel {
       // Keep the list being left as it is (every page loaded so far and the
       // scroll position), so Back lands on the same row instead of page one.
       var back = { sections: sections, pageHeader: pageHeader, moreToken: moreToken, morePath: morePath,
-        moreEager: moreEager, rowKeys: rowKeys, y: list.contentY, listError: listError }
+        moreEager: moreEager, rowKeys: rowKeys, y: list.contentY, listError: listError, listFailed: listFailed }
       // Keep the tile's own play endpoint (album and playlist tiles carry one),
       // and drop the list being left. While the new page loaded, the Play
       // button used the old rows and started their first song, and the old
@@ -2702,6 +2716,7 @@ Panel {
     loading = false
     loadingMore = false
     listError = b.listError
+    listFailed = !!b.listFailed
     pageHeader = b.pageHeader
     rowKeys = b.rowKeys
     morePath = b.morePath
@@ -4006,6 +4021,7 @@ Panel {
             height: parent.height - y
 
             Text {
+              id: listMsg
               anchors.centerIn: parent
               width: parent.width - Style.space(40)
               horizontalAlignment: Text.AlignHCenter
@@ -4021,6 +4037,19 @@ Panel {
               color: root.a(root.fg, 0.55)
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
+            }
+            // Only re-clicking a tab retried before (deep review 2026-10-01).
+            // Above the (empty) ListView, which fills the same area and would
+            // take the click otherwise.
+            Button {
+              z: 2
+              anchors.top: listMsg.bottom
+              anchors.topMargin: Style.space(12)
+              anchors.horizontalCenter: parent.horizontalCenter
+              visible: listMsg.visible && !root.loading && (root.appOffline || root.listFailed)
+              text: "Try again"
+              bordered: true
+              onClicked: root.retryList()
             }
 
             ListView {

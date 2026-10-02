@@ -88,6 +88,29 @@ QtObject {
     return detached.filter(function(a) { return JSON.stringify(a).indexOf(word) >= 0 })
   }
 
+  // Every item under `item` (visual children) that pred() accepts.
+  function findAll(item, pred) {
+    var out = []
+    var walk = function(o) {
+      if (!o) return
+      if (pred(o)) out.push(o)
+      var kids = o.children || []
+      for (var i = 0; i < kids.length; i++) walk(kids[i])
+    }
+    walk(item)
+    return out
+  }
+  // A visible Button (the stub) with this text, or null.
+  function button(item, text) {
+    var b = findAll(item, function(o) { return o.text === text && o.bordered !== undefined && isShown(o, item) })
+    return b.length ? b[0] : null
+  }
+  // Shown as far as the widget goes (the TestCase item itself is invisible).
+  function isShown(o, top) {
+    for (var p = o; p && p !== top; p = p.parent) if (!p.visible) return false
+    return true
+  }
+
   property Component timerComp: Component { Timer { property var fn; onTriggered: { fn(); destroy() } } }
   function later(ms, fn) {
     var t = timerComp.createObject(h, { interval: Math.max(0, ms), fn: fn })
