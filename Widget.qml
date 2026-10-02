@@ -1023,6 +1023,17 @@ Panel {
     root.reportedPosition = ls.elapsedSeconds
     shareLast(ls)
   }
+  // Left and Right in the panel: back or forward by sec within the song (the
+  // remembered one's resume point while nothing of the user's is loaded, as
+  // the seek bar does). Forward stops a second short of the end, so a press
+  // near the end does not roll into the next song. Timed lyrics jump at once.
+  function seekBy(sec) {
+    if (!hasSong || duration <= 0) return
+    var to = Math.max(0, Math.min(duration - 1, position + sec))
+    if (sec > 0 && to < position) return
+    seekTo(to)
+    if (lyricsLive) lyricsAnchor = { t: to, at: Date.now(), playing: lyricsAnchor.playing }
+  }
   // The app reports volume on another scale than it is set on: /volume 57
   // comes back as 26 in VOLUME_CHANGED and GET /volume (its player applies a
   // loudness curve). Taking that echo as the slider value made the knob drop
@@ -3372,6 +3383,7 @@ Panel {
 
     PanelKeyCatcher {
       id: keys
+      objectName: "keyCatcher"
       anchors.fill: parent
       // While the search field has focus it owns the keyboard (its Keys
       // handler does Enter, Esc and Down). Otherwise keys the field passes on
@@ -3397,7 +3409,13 @@ Panel {
         spaceGuard.restart()
         root.playPause()
       }
-      onMoveRequested: function(dx, dy) { if (dy !== 0) root.moveCursor(dy) }
+      // Up and Down pick a row; Left and Right seek 10 s (asked for
+      // 2026-10-01). The catcher is blocked while the search field has
+      // focus, so there they still move the text cursor.
+      onMoveRequested: function(dx, dy) {
+        if (dy !== 0) root.moveCursor(dy)
+        else if (dx !== 0) root.seekBy(10 * dx)
+      }
       // Tab and Shift+Tab move to the next bar panel, like the built-in panels.
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(t) { if (t === "/") searchField.forceActiveFocus() }
@@ -3986,6 +4004,7 @@ Panel {
 
           TextField {
             id: searchField
+            objectName: "searchField"
             width: parent.width
             placeholderText: "Search songs, albums, artists and playlists (press /)"
             font.family: root.fontFamily
