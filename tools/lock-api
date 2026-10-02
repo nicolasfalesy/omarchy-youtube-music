@@ -96,6 +96,17 @@ clients_ok() {
 # panel's Set up on a new profile, 2026-09-28).
 strategy_now() { jq -r '.plugins["api-server"].authStrategy // "AUTH_AT_FIRST"' "$cfg" 2>/dev/null; }
 strategy_is() { [[ $(strategy_now) == "$1" ]]; }
+# The saved token names a client the app still lets in: its JWT payload's id
+# (decoded here, never printed) is in authorizedClients. A token file that
+# holds no token, or a token whose id was dropped, counted as "locked" and
+# left the widget with a token the app refuses (2026-10-01 review).
+token_authorized() {
+  jq -e --rawfile t "$tok" 'try (
+      ($t | rtrimstr("\n") | split(".") | if length == 3 then .[1] else error end
+        | gsub("-"; "+") | gsub("_"; "/") | @base64d | fromjson | .id | strings) as $id
+      | any((.plugins["api-server"].authorizedClients // [])[]; . == $id)
+    ) catch false' "$cfg" >/dev/null 2>&1
+}
 
 # Quit the app: through the widget first, then Browser.close straight to the
 # bridge's socket (in case the shell is down), and SIGKILL only as the last
@@ -162,10 +173,11 @@ trap 'exit 129' HUP
 [[ -f $cfg ]] || { echo "No $cfg: start YouTube Music once and sign in first." >&2; exit 1; }
 strategy=$(strategy_now)
 
-# "Already locked" needs the API to refuse a caller without a token too: after
+# "Already locked" needs a token the app still accepts (token_authorized), and
+# the API to refuse a caller without a token too: after
 # a run where the app would not quit, config.json says AUTH_AT_FIRST and the
 # token exists, but the running app still answers anyone.
-if [[ $strategy == AUTH_AT_FIRST && -s $tok ]] && ! up; then
+if [[ $strategy == AUTH_AT_FIRST && -s $tok ]] && token_authorized && ! up; then
   echo "Already locked (AUTH_AT_FIRST, token present)."
   exit 0
 fi
@@ -194,7 +206,11 @@ token=$(printf 'url = "%s"\n' "$api/auth/$id" | curl -fsS -m 10 -X POST -K - | j
 [[ -n $token ]] || { echo "The app gave no token." >&2; exit 1; }
 mkdir -p "${tok%/*}"
 printf '%s\n' "$token" | replace_with "$tok" 600 cat
-printf 'header = "Authorization: Bearer %s"\n' "$token" | up -K - || { echo "The new token does not work." >&2; exit 1; }
+if ! printf 'header = "Authorization: Bearer %s"\n' "$token" | up -K -; then
+  rm -f -- "$tok"  # never leave the widget a token that does not work
+  echo "The new token does not work." >&2
+  exit 1
+fi
 
 minted=1
 

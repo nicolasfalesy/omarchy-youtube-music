@@ -201,3 +201,44 @@ class LockApiTest(Case):
         rc, _, _ = self.lock()
         self.assertEqual(rc, 1)
         self.assertEqual(self.read_config()["plugins"]["api-server"]["authorizedClients"], ["kept-client"])
+
+    # --- "Already locked" only when the saved token would really work ---
+    def test_a_token_whose_client_was_dropped_is_replaced(self):
+        self.config(clients=["someone-else"])
+        self.save_token(fake_token("nic-bar-dropped"))
+        rc, out, err = self.lock()
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("Already locked", out)
+        self.assertIn("Locked:", out)
+        self.assertEqual(self.read_config()["plugins"]["api-server"]["authorizedClients"], [token_id(self.read_token())])
+
+    def test_a_token_file_that_holds_no_token_is_replaced(self):
+        self.config(clients=["nic-bar-x"])
+        self.save_token("not a token at all")
+        rc, out, err = self.lock()
+        self.assertEqual(rc, 0, err)
+        self.assertIn("Locked:", out)
+        token_id(self.read_token())  # a real token now
+
+    def test_a_symlink_at_the_token_path_is_replaced_not_trusted(self):
+        self.config()
+        victim = os.path.join(self.dir, "victim.txt")
+        with open(victim, "w") as f:
+            f.write("keep me\n")
+        os.makedirs(os.path.dirname(self.token_path()))
+        os.symlink(victim, self.token_path())
+        rc, out, err = self.lock()
+        self.assertEqual(rc, 0, err)
+        self.assertIn("Locked:", out)
+        self.assertFalse(os.path.islink(self.token_path()))
+        with open(victim) as f:
+            self.assertEqual(f.read(), "keep me\n")
+
+    def test_a_new_token_that_does_not_work_is_not_kept(self):
+        self.config()
+        self.ctl_on("die_after_mint")
+        rc, out, err = self.lock()
+        self.assertEqual(rc, 1)
+        self.assertIn("does not work", err)
+        self.assertFalse(os.path.lexists(self.token_path()))
+        self.assert_locked_on_disk()

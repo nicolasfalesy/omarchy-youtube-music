@@ -159,8 +159,9 @@ class App:
                 log("api", method="POST", path="/auth", minted=True)
                 self.reply(200, b"{}" if ctl("mint_empty") else
                            json.dumps({"accessToken": app.mint(client)}).encode())
-                if ctl("die_after_mint"):
-                    threading.Timer(0.2, lambda: (log("died"), os._exit(1))).start()
+                if ctl("die_after_mint"):  # the answer is out (unbuffered); then gone
+                    log("died")
+                    os._exit(1)
 
         http.server.HTTPServer.allow_reuse_address = True
         try:
