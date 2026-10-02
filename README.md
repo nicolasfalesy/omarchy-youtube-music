@@ -72,7 +72,7 @@ to this widget**: it mints a token only the widget holds (saved mode 600 in
 `~/.local/state/omarchy/nic-youtube-music/token`) and switches the app to `AUTH_AT_FIRST`, so
 any other program, or a web page, is refused. It also adds a menu entry that starts the app
 through `tools/cdp-bridge` (see below), removes any old `--remote-debugging-port` line from
-`~/.config/youtube-music-flags.conf`, and turns off the app's `resumeOnStart`, tray,
+`~/.config/youtube-music-flags.conf` (or `~/.config/pear-flags.conf` for the source package), and turns off the app's `resumeOnStart`, tray,
 start-at-login and its own updater (the widget does the resuming and quits the app when idle;
 the package manager updates the app). If the app's API ever answers without the token again,
 the panel says so and offers Set up. Setup only reports the API locked after checking that the
@@ -114,7 +114,7 @@ lyrics timing do not until it is quit and started again from the widget or the m
 ## Dependencies
 
 - Omarchy 4 (the Quickshell `omarchy-shell` and Lua Hyprland config).
-- [pear-desktop](https://github.com/pear-devs/pear-desktop) (`pear-desktop-bin` from the AUR),
+- [pear-desktop](https://github.com/pear-devs/pear-desktop): either `pear-desktop-bin` from the AUR (upstream's build, with its own Electron) or `pear-desktop` (built from source on Arch's `electron42`, so Electron security fixes arrive with system updates),
   signed in to a YouTube Music account.
 - `python3` for `tools/cdp-bridge`, and `jq`, `curl` and `openssl` for `tools/setup` and
   `tools/lock-api`; `ss` (iproute2) to check who owns the API port, and `notify-send`

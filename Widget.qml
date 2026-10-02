@@ -2964,7 +2964,12 @@ Panel {
   //    copy (same-name rules replace each other, checked on Hyprland 0.56),
   //    and it is added again after a config reload, which drops runtime
   //    rules. A matching rule in hyprland.lua does no harm.
+  // Either package counts as installed: pear-desktop-bin (upstream's build,
+  // with its bundled Electron) or pear-desktop (built from source, runs on
+  // Arch's electron42 and so gets Electron security fixes with the system).
+  // tools/cdp-bridge --which picks between them the same way.
   readonly property string appPath: "/opt/YouTube Music/youtube-music"
+  readonly property string sourceAppPath: "/usr/bin/pear-desktop"
   // The setup screen's notes. A word joiner (U+2060) on each side of the
   // hyphens in package names keeps them on one line: the text broke as
   // "(pear-" / "desktop)". It is invisible, and a font without it (the
@@ -2976,7 +2981,7 @@ Panel {
   readonly property string setupText: "Set up turns on the app's local API (on 127.0.0.1 only) and locks it to this widget "
     + "with a private token. It turns off the app's tray, start at login, resume on start and its own updater "
     + "(the widget does the resuming, the package manager the updates), takes any old debugging lines out of "
-    + "~/.config/youtube-music-flags.conf (keeping a backup next to it), "
+    + "~/.config/youtube-music-flags.conf or pear-flags.conf (keeping a backup next to it), "
     + "and adds a YouTube Music menu entry. The app starts and quits once while it runs. Nothing else changes. "
     + "Sign in inside the app afterwards if it asks."
   // Assumed installed until checked, so a normal start never flashes the
@@ -2989,7 +2994,7 @@ Panel {
   function checkInstalled() { if (!installCheck.running) installCheck.running = true }
   Process {
     id: installCheck
-    command: ["test", "-x", root.appPath]
+    command: ["sh", "-c", "test -x \"$1\" || test -x \"$2\"", "sh", root.appPath, root.sourceAppPath]
     onExited: function(exitCode) { root.appInstalled = exitCode === 0 }
   }
   // While the install screen shows, look again every 2 s, so it moves on by
