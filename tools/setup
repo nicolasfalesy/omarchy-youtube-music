@@ -10,13 +10,15 @@
 #      tools/cdp-bridge, which starts the app with --remote-debugging-pipe and
 #      serves it on a Unix socket only this user can open. An open
 #      --remote-debugging-port would give every local program and user full
-#      control of the signed-in app, so this removes any such line from
+#      control of the signed-in app, so this removes any such line (and any
+#      --inspect line, Node's debugger) from
 #      ~/.config/youtube-music-flags.conf (older versions of this plugin told
 #      you to add one).
 #   3. A menu entry that starts the app through the bridge, so starting it from
 #      the app launcher gives the widget its pipe too (and still no port).
 #   4. resumeOnStart, tray and startAtLogin off: the widget does the resuming,
-#      and the app quits when idle.
+#      and the app quits when idle. autoUpdates off: the package manager
+#      updates the app, so its own updater only pops up prompts.
 #
 # The widget's panel runs this on its "Set up" button (the user's consent);
 # it also works from a terminal. On a first run the app has no settings file
@@ -48,7 +50,12 @@ replace_with() {
   rm -f -- "$tmp"
   return 1
 }
-strip_debug_flags() { grep -v -- '--remote-debugging-' "$flags" || true; }
+# A line with any switch that opens a debugging channel: --remote-debugging-*
+# or Node's --inspect* (honoured by the app's Electron build), spelled with
+# one dash or two and "_" or "-", as Chromium and Node read them. The same
+# rule as tools/cdp-bridge, which also drops them at every start.
+debug_switch='(^|[[:space:]])--?(remote[-_]debugging[-_]|inspect)'
+strip_debug_flags() { grep -Eiv -- "$debug_switch" "$flags" || true; }
 app_running() {
   local p
   for p in $(pgrep -f "^$app" || true); do
@@ -89,17 +96,18 @@ if app_running; then
 fi
 
 # 2. No debug port.
-if [[ -f $flags ]] && grep -q -- '--remote-debugging-' "$flags"; then
+if [[ -f $flags ]] && grep -Eiq -- "$debug_switch" "$flags"; then
   # The backup's name comes from mktemp too (created exclusively, mode 600).
   bak=$(mktemp -- "$flags.bak.XXXXXXXX") && cat -- "$flags" > "$bak"
   replace_with "$flags" 600 strip_debug_flags
-  say "Removed the debug-port lines from $flags (a backup is next to it)."
+  say "Removed the debugging lines from $flags (a backup is next to it)."
 fi
 
 # 4. and the API server's place. authStrategy is left to lock-api: it has to
 # be NONE for the one moment it takes to mint the token.
 replace_with "$cfg" 600 jq '.plugins["api-server"] = ((.plugins["api-server"] // {}) + {enabled: true, hostname: "127.0.0.1", port: 26538, useHttps: false})
-    | .options.resumeOnStart = false | .options.tray = false | .options.startAtLogin = false' "$cfg"
+    | .options.resumeOnStart = false | .options.tray = false | .options.startAtLogin = false
+    | .options.autoUpdates = false' "$cfg"
 
 # 3. The menu entry. A user entry with the same name hides the packaged one.
 mkdir -p -- "$apps"

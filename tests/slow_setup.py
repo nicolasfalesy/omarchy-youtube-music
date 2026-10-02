@@ -10,7 +10,7 @@ import subprocess
 from ytmtest import Case, TOOLS
 
 SECRET = "fake-secret-for-tests"
-OFF = ("resumeOnStart", "tray", "startAtLogin")
+OFF = ("resumeOnStart", "tray", "startAtLogin", "autoUpdates")
 
 
 class SetupTest(Case):
@@ -26,7 +26,7 @@ class SetupTest(Case):
         return p.returncode, out, err
 
     def profile(self, **api):
-        conf = {"options": {k: True for k in OFF + ("autoUpdates",)},
+        conf = {"options": {k: True for k in OFF},
                 "plugins": {"api-server": dict({"enabled": True, "authStrategy": "AUTH_AT_FIRST", "secret": SECRET}, **api)}}
         return self.write_config(conf)
 
@@ -82,11 +82,12 @@ class SetupTest(Case):
 
     def test_debug_port_lines_are_removed_with_a_private_backup(self):
         self.profile()
-        flags = self.write_flags("--ozone-platform=wayland\n--remote-debugging-port=9222\n")
+        flags = self.write_flags("--ozone-platform=wayland\n--remote-debugging-port=9222\n--inspect=127.0.0.1:9229\n"
+                                 "-remote-debugging-port=9223\n--Inspect_Brk\n--enable-features=Foo\n")
         rc, _, err = self.setup_run()
         self.assertEqual(rc, 0, err)
         with open(flags) as f:
-            self.assertEqual(f.read(), "--ozone-platform=wayland\n")
+            self.assertEqual(f.read(), "--ozone-platform=wayland\n--enable-features=Foo\n")
         self.assertEqual(stat.S_IMODE(os.stat(flags).st_mode), 0o600)
         baks = [n for n in os.listdir(os.path.dirname(flags)) if n.startswith("youtube-music-flags.conf.bak.")]
         self.assertEqual(len(baks), 1)
