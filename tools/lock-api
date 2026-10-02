@@ -166,12 +166,16 @@ if ! up; then
 fi
 
 # 2. Mint and save the token.
+# The client id (half of what a forged token needs) and the token reach curl
+# on stdin as config lines (-K -), never as arguments: every user can read a
+# process's arguments in /proc/<pid>/cmdline. printf is a shell builtin, so
+# it never shows there either (2026-10-01 review).
 id="nic-bar-$(openssl rand -hex 16)"
-token=$(curl -fsS -m 10 -X POST "$api/auth/$id" | jq -r '.accessToken // empty')
+token=$(printf 'url = "%s"\n' "$api/auth/$id" | curl -fsS -m 10 -X POST -K - | jq -r '.accessToken // empty')
 [[ -n $token ]] || { echo "The app gave no token." >&2; exit 1; }
 mkdir -p "${tok%/*}"
 printf '%s\n' "$token" | replace_with "$tok" 600 cat
-up -H "Authorization: Bearer $token" || { echo "The new token does not work." >&2; exit 1; }
+printf 'header = "Authorization: Bearer %s"\n' "$token" | up -K - || { echo "The new token does not work." >&2; exit 1; }
 
 minted=1
 

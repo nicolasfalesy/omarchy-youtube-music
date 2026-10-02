@@ -164,3 +164,23 @@ class LockApiTest(Case):
         self.assertIn("Locked:", out)
         self.assert_locked_on_disk()
         self.assertEqual(self.app_events("quit"), [])
+
+    # --- the token never shows in a process list ---
+    def test_the_token_never_goes_on_a_command_line(self):
+        # /proc/<pid>/cmdline is readable by every user; a curl wrapper first
+        # in PATH records every argument it gets.
+        argv_log = os.path.join(self.dir, "curl-argv.log")
+        wrapper = os.path.join(self.bin, "curl")
+        with open(wrapper, "w") as f:
+            f.write('#!/bin/bash\nprintf "%%s\\n" "$@" >> %s\nexec /usr/bin/curl "$@"\n' % argv_log)
+        os.chmod(wrapper, 0o755)
+        self.config()
+        rc, _, err = self.lock()
+        self.assertEqual(rc, 0, err)
+        token = self.read_token()
+        with open(argv_log) as f:
+            seen = f.read()
+        self.assertFalse(token in seen, "the token was on curl's command line")
+        self.assertFalse(token_id(token) in seen, "the client id was on curl's command line")
+        self.assertTrue([e for e in self.app_events("api") if e.get("bearer")],
+                        "the new token was checked against the API")
