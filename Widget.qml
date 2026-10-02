@@ -707,7 +707,7 @@ Panel {
         ep.startTimeSeconds = at
         // Fallback only: if the first push lands more than 5 s off within 20 s,
         // seek once (see POSITION_CHANGED).
-        root.resumeTarget = { videoId: ls.videoId, at: at, until: Date.now() + 20000 }
+        root.resumeTarget = { videoId: ls.videoId, at: at, since: Date.now() }
       } else root.resumeTarget = null
       var navigate = function() {
         root.expect(ls.videoId)
@@ -998,7 +998,7 @@ Panel {
   property double volSentAt: 0
   function takeAppVolume(r) {
     if (volSent >= 0 && Math.abs(volCurveMap(volSent, 0, 1) - r) <= 1.5) { volume = volSent; return }
-    if (Date.now() - volSentAt < 1000) return
+    if (ageMs(volSentAt) < 1000) return
     volSent = -1
     volume = Math.round(volCurveMap(r, 1, 0))
   }
@@ -1199,7 +1199,7 @@ Panel {
         // showed the cue as playing, the "Meet Me Halfway" bug again
         // (offline test, 2026-09-24). A VIDEO_CHANGED for another
         // video leaves the wait for its own song; expectTimer ends it.
-        var wasReal = root.songReal && (root.isPlaying || now - root.stoppedPlayingAt < 5000)
+        var wasReal = root.songReal && (root.isPlaying || root.ageMs(root.stoppedPlayingAt) < 5000)
         var vid = m.song ? String(m.song.videoId || "") : ""
         var mine = root.expectSong && (root.expectVideo === "" || vid === root.expectVideo)
         root.songReal = wasReal || mine
@@ -1245,8 +1245,8 @@ Panel {
         // Two pushes in a row that move forward by up to 2.5 s within 2.5 s
         // prove the song plays. This is the only sign of a play that started
         // at 0:00 (the app never reports one), which otherwise stayed "paused".
-        var moving = p > root.posPushPos && p - root.posPushPos <= 2.5 && now - root.posPushAt < 2500
-          && now - root.pausedAt > 3000
+        var moving = p > root.posPushPos && p - root.posPushPos <= 2.5 && root.ageMs(root.posPushAt) < 2500
+          && root.ageMs(root.pausedAt) > 3000
         root.posPushPos = p
         root.posPushAt = now
         root.lastPush = now
@@ -1266,12 +1266,12 @@ Panel {
         var target = root.resumeTarget
         if (target && root.song && root.song.videoId === target.videoId) {
           root.resumeTarget = null
-          if (now < target.until && Math.abs(p - target.at) > 5) {
+          if (root.ageMs(target.since) < 20000 && Math.abs(p - target.at) > 5) {
             root.position = target.at
             root.reportedPosition = target.at
             root.cmd("/seek-to", { seconds: target.at })
           }
-        } else if (target && now >= target.until) root.resumeTarget = null
+        } else if (target && root.ageMs(target.since) >= 20000) root.resumeTarget = null
       } else if (m.type === "VOLUME_CHANGED") {
         root.takeAppVolume(Number(m.volume))
         root.muted = !!m.muted
@@ -1443,7 +1443,7 @@ Panel {
     interval: 250
     repeat: true
     running: root.isPlaying && root.appUp && root.songReal && root.opened
-    onTriggered: if (Date.now() - root.lastPush < 2000 && (root.duration <= 0 || root.position < root.duration)) root.position += 0.25
+    onTriggered: if (root.ageMs(root.lastPush) < 2000 && (root.duration <= 0 || root.position < root.duration)) root.position += 0.25
   }
 
   // Ask the page what the player really does, and believe it. See the header
@@ -1502,15 +1502,19 @@ Panel {
     interval: 3000
     repeat: true
     running: root.appUp && root.isPlaying
-    onTriggered: if (Date.now() - root.lastPush >= 2500) root.checkPlayState()
+    onTriggered: if (root.ageMs(root.lastPush) >= 2500) root.checkPlayState()
   }
 
   // ------------------------------------------------------------ page bridge (CDP)
   property int cdpId: 0
   property var cdpPending: ({})
   // A call that never answers (a fetch stuck on a dead connection) left
-  // "Loading…" up for good. Each call gets 20 s, then fails like a closed socket.
+  // "Loading…" up for good. Each call gets 20 s, then fails like a closed
+  // socket. The map holds when each call was sent (not a deadline), so a
+  // clock stepped back makes a call late (ageMs), never one that waits for
+  // good.
   property var cdpDeadline: ({})
+  readonly property int cdpTimeoutMs: 20000
   property var cdpQueue: []                // [{id, msg, offlineOk}] waiting for the socket
   property bool cdpLooking: false
   // pear swaps in its own offline page (assets/error.html) whenever a page
@@ -1648,7 +1652,7 @@ Panel {
     onTriggered: {
       var now = Date.now()
       var late = []
-      for (var k in root.cdpDeadline) if (root.cdpDeadline[k] < now) late.push(Number(k))
+      for (var k in root.cdpDeadline) if (root.ageMs(root.cdpDeadline[k]) > root.cdpTimeoutMs) late.push(Number(k))
       if (!late.length) return
       root.cdpQueue = root.cdpQueue.filter(function(q) { return late.indexOf(q.id) < 0 })
       for (var i = 0; i < late.length; i++) root.cdpFailOne(late[i], "YouTube Music did not answer. Try again.")
@@ -1659,7 +1663,7 @@ Panel {
     root.cdpId += 1
     var id = root.cdpId
     root.cdpPending[id] = cb || function() {}
-    root.cdpDeadline[id] = Date.now() + 20000
+    root.cdpDeadline[id] = Date.now()
     root.cdpWrite({ id: id, method: method, params: params })
   }
   // Find the page and attach to it, then send what queued up meanwhile.
@@ -1716,7 +1720,7 @@ Panel {
     root.cdpId += 1
     var id = root.cdpId
     root.cdpPending[id] = cb || function() {}
-    root.cdpDeadline[id] = Date.now() + 20000
+    root.cdpDeadline[id] = Date.now()
     var cmd = { id: id, method: method, params: params }
     if (cdpSock.connected && root.cdpSession !== "" && (root.cdpSessionKind === "music" || offlineOk)) {
       cmd.sessionId = root.cdpSession
@@ -1788,7 +1792,7 @@ Panel {
   // while someone is looking (panel open) or a play is waiting. The error page
   // is a file:// page, so CDP's Page.navigate works on it whatever has focus.
   function retryAppPage() {
-    if (!appUp || !(opened || pendingAction !== "") || Date.now() - lastPageRetry < 10000) return
+    if (!appUp || !(opened || pendingAction !== "") || ageMs(lastPageRetry) < 10000) return
     lastPageRetry = Date.now()
     cdpSend("Page.navigate", { url: "https://music.youtube.com/" }, function(v, err) {
       if (err) return
