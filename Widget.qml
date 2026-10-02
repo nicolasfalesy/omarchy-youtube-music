@@ -3077,6 +3077,27 @@ Panel {
     else if (button === Qt.MiddleButton) { if (hasSong) next() }
     else toggle()
   }
+  // Scrolling on the bar skips songs: up = previous, down = next (asked for
+  // 2026-10-01; Omarchy's own media widget does the same). One skip per 120
+  // units (a mouse notch); after a skip, nothing more until the wheel has
+  // been still for 300 ms, so one trackpad flick (dozens of small events) is
+  // one skip, not ten. Only with one of the user's songs loaded: a scroll
+  // never starts the app or music.
+  property real wheelAcc: 0
+  Timer { id: wheelQuiet; interval: 300 }
+  Timer { id: wheelForget; interval: 400; onTriggered: root.wheelAcc = 0 }
+  function wheelStep(dy) {
+    if (wheelQuiet.running) { wheelQuiet.restart(); wheelAcc = 0; return }
+    if (!songLive) { wheelAcc = 0; return }
+    wheelAcc += dy
+    wheelForget.restart()
+    if (Math.abs(wheelAcc) < 120) return
+    var up = wheelAcc > 0
+    wheelAcc = 0
+    wheelQuiet.restart()
+    if (up) previous()
+    else next()
+  }
   // appShown starts false after a shell restart even if the app is on screen.
   Component.onCompleted: readAppShown()
 
@@ -3170,6 +3191,7 @@ Panel {
     cursorShape: Qt.PointingHandCursor
     acceptedButtons: Qt.LeftButton | Qt.RightButton | Qt.MiddleButton
     onClicked: function(mouse) { root.triggerPress(mouse.button) }
+    onWheel: function(wheel) { root.wheelStep(wheel.angleDelta.y); wheel.accepted = true }
     onEntered: if (root.bar && !root.opened) root.bar.showTooltip(root, root.barTip())
     onExited: if (root.bar) root.bar.hideTooltip(root)
   }
