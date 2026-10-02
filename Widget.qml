@@ -2947,9 +2947,15 @@ Panel {
   // The URL for try number `attempt` (0 = as given). Hosts without known
   // twins (www.gstatic.com) just ask again, which works once Qt has dropped
   // the dead connection.
+  //
+  // Only https URLs on Google's image hosts load at all (anything else gives
+  // ""). The shell fetches every image itself, and the URLs come from
+  // YouTube's data, the app's API and last.json: a file:// or plain-http URL
+  // there was loaded as given (deep review 2026-10-01).
   function artAt(url, attempt) {
     url = String(url || "")
-    if (!attempt || url === "") return url
+    if (!artUrlOk(url)) return ""
+    if (!attempt) return url
     var m = /^https:\/\/([^\/]+)(\/.*)$/.exec(url)
     var alts = m ? artHosts[m[1]] : null
     if (!alts) return url + (url.indexOf("?") < 0 ? "?" : "&") + "try=" + attempt
@@ -3105,11 +3111,17 @@ Panel {
         visible: backdrop.status === Image.Ready && root.hasSong
         ArtImage {
           id: backdrop
+          objectName: "backdropArt"
           anchors.fill: parent
           url: root.artUrl
           fillMode: Image.PreserveAspectCrop
           asynchronous: true
           visible: false
+          // Decoded at about the big cover's size, not the file's: it is
+          // blurred anyway, and a full-size decode of whatever the URL holds
+          // has no other limit (Qt's own cap is 256 MB).
+          sourceSize.width: Style.space(544)
+          sourceSize.height: Style.space(544)
         }
         MultiEffect {
           anchors.fill: parent
@@ -3248,11 +3260,15 @@ Panel {
             color: root.a(root.fg, 0.06)
             ArtImage {
               id: art
+              objectName: "coverArt"
               anchors.fill: parent
               url: root.artUrl
               fillMode: Image.PreserveAspectCrop
               asynchronous: true
               visible: status === Image.Ready
+              // Drawn 270 px wide; 544 keeps it sharp at scale 2.
+              sourceSize.width: Style.space(544)
+              sourceSize.height: Style.space(544)
             }
             Text {
               anchors.centerIn: parent
