@@ -1838,8 +1838,17 @@ Panel {
   }
   // Raw DEFLATE (RFC 1951) from byte pos of src, the way zlib's puff.c does
   // it: one bit at a time, slow but tiny, and a song's lyrics are about 20 KB.
+  //
+  // The output stops at inflateMax. The answer is capped at 2 MiB by curl, but
+  // DEFLATE packs up to about 1000:1, so a 2 KB answer can ask for megabytes
+  // and a 2 MiB one for gigabytes, all built here on the shell's UI thread
+  // (a 19 KB stream gave 20 MB in 2.2 s and 569 MB of memory, deep review
+  // 2026-10-01). Past the cap it throws; kugouLookup then falls back to
+  // LRCLIB like for any unreadable answer.
+  readonly property int inflateMax: 1024 * 1024
   function inflate(src, pos) {
-    var out = [], bitbuf = 0, bitcnt = 0
+    var out = [], bitbuf = 0, bitcnt = 0, max = root.inflateMax
+    var tooBig = function() { throw new Error("inflate: output over 1 MiB") }
     var LBASE = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258]
     var LEXT = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0]
     var DBASE = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073,
@@ -1881,11 +1890,12 @@ Panel {
     var codes = function(lencode, distcode) {
       for (;;) {
         var sym = decode(lencode)
-        if (sym < 256) { out.push(sym); continue }
+        if (sym < 256) { if (out.length >= max) tooBig(); out.push(sym); continue }
         if (sym === 256) return
         sym -= 257
         if (sym >= 29) throw new Error("inflate: bad length")
         var len = LBASE[sym] + bits(LEXT[sym])
+        if (out.length + len > max) tooBig()
         var ds = decode(distcode)
         if (ds >= 30) throw new Error("inflate: bad distance")
         var from = out.length - DBASE[ds] - bits(DEXT[ds])
@@ -1904,6 +1914,7 @@ Panel {
         var n = src[pos] | (src[pos + 1] << 8)
         pos += 4
         if (pos + n > src.length) throw new Error("inflate: data ends early")
+        if (out.length + n > max) tooBig()
         for (i = 0; i < n; i++) out.push(src[pos++])
       } else if (type === 1) {
         var fl = [], fd = []
