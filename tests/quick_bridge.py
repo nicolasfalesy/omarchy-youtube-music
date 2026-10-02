@@ -115,6 +115,46 @@ class BridgeTest(Case):
                 stuck.recv(timeout=10)
         self.assertIsNone(p.poll(), "the bridge keeps running")
 
+    def test_malformed_messages_from_the_app_are_skipped(self):
+        p = self.bridge_up()
+        c = Conn(self.sock)
+        c.send({"id": 1, "method": "Fake.bad", "params": {}})
+        self.assertEqual(c.recv(), {"id": 1, "result": {"after": "bad"}})
+        self.assertIsNone(p.poll())
+
+    def test_malformed_lines_from_a_client_are_skipped(self):
+        p = self.bridge_up()
+        bad, good = Conn(self.sock), Conn(self.sock)
+        bad.s.sendall(b"[" * 200000 + b"]" * 200000 + b"\n" + b'{"id":{"a":1},"method":"Target.getTargets"}\n'
+                      + b"\xff\xfe\n[1,2]\n")
+        time.sleep(0.3)
+        good.send({"id": 2, "method": "Target.getTargets", "params": {}})
+        self.assertEqual(good.recv()["id"], 2)
+        self.assertIsNone(p.poll())
+
+    def test_an_answer_over_the_size_cap_becomes_an_error(self):
+        self.bridge_up()
+        c = Conn(self.sock)
+        c.send({"id": 1, "method": "Fake.big", "params": {"bytes": 40 * 1024 * 1024}})
+        c.send({"id": 2, "method": "Target.getTargets", "params": {}})
+        first = c.recv(timeout=20)
+        self.assertEqual(first["id"], 1)
+        self.assertIn("error", first)
+        self.assertEqual(c.recv()["id"], 2, "the next answer still arrives whole")
+
+    def test_a_client_line_over_the_size_cap_drops_that_client(self):
+        p = self.bridge_up()
+        big, good = Conn(self.sock), Conn(self.sock)
+        try:
+            big.s.sendall(b"x" * (33 * 1024 * 1024))
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        with self.assertRaises((EOFError, ConnectionResetError)):
+            big.recv(timeout=10)
+        good.send({"id": 3, "method": "Target.getTargets", "params": {}})
+        self.assertEqual(good.recv()["id"], 3)
+        self.assertIsNone(p.poll())
+
 
 def race_once(case):
     """Two bridges started at the same moment (two widget copies waking the

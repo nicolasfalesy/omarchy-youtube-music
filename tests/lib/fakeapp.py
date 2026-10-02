@@ -17,6 +17,8 @@ $FAKE_LOG, so a test can check what reached the app:
     Bearer JWT (HS256, the config's secret) whose id is in authorizedClients.
     POST /auth/<id> mints a token, under NONE only. Each request is logged with
     whether it carried a valid token, never the token itself.
+Fake.big answers params.bytes of filler, Fake.event sends an event first,
+Fake.bad sends malformed messages before its answer.
 Control files in $FAKE_CTL: noquit (ignore Browser.close and pipe EOF),
 mint_empty (mint answers {}), die_after_mint (exit right after a mint),
 spaced (answers as {"result": ..., "id": N}, not Chromium's compact form).
@@ -204,6 +206,14 @@ class App:
                     self.quit("Browser.close")
                 elif method == "Fake.big":
                     self.answer(cmd, {"blob": "x" * int(params.get("bytes", 3_000_000))})
+                elif method == "Fake.bad":
+                    # Odd things a broken or hostile peer could write: ids that are
+                    # not numbers, nesting deeper than any parser allows, not JSON.
+                    for junk in (b'{"id":[1],"result":{}}', b'{"id":{"a":1},"result":{}}',
+                                 b'{"id":true,"result":{}}', b"[" * 200000 + b"]" * 200000,
+                                 b"[1,2,3]", b"not json \xff"):
+                        self.send(junk)
+                    self.answer(cmd, {"after": "bad"})
                 elif method == "Fake.event":
                     self.send(json.dumps({"method": "Fake.event", "params": {}}, separators=(",", ":")).encode())
                     self.answer(cmd, {})

@@ -32,6 +32,7 @@ Started by the widget when the app is needed, and by the app's menu entry
 import fcntl
 import json
 import os
+import re
 import select
 import signal
 import socket
@@ -43,7 +44,11 @@ import time
 APP = os.environ.get("NIC_YTM_APP", "/opt/YouTube Music/youtube-music")
 FLAGS_FILE = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
                           "youtube-music-flags.conf")
-MAX_PENDING = 256 * 1024 * 1024  # bytes without a separator before a peer is dropped
+# The biggest one message may be, either way. Real answers are a few MB (the
+# library); without a cap a peer could make the bridge buffer without end.
+# An answer over it is dropped and its asker gets a CDP error instead; a
+# client line over it drops that client.
+MAX_MESSAGE = 32 * 1024 * 1024
 # Bytes waiting to be sent to one connection before it is dropped. Each
 # connection has its own queue and the sockets are non-blocking, so one that
 # stops reading (a hung or stopped client) never holds up the others: a
@@ -120,6 +125,24 @@ def app_env():
     for name in ("NODE_OPTIONS", "ELECTRON_RUN_AS_NODE"):
         env.pop(name, None)
     return env
+
+
+def parse(raw):
+    """One JSON object, or None for anything else: not JSON, not an object,
+    or nested deeper than the parser allows (that raises RecursionError, not
+    ValueError, and used to kill the bridge, 2026-10-01 review)."""
+    try:
+        msg = json.loads(raw)
+    except (ValueError, RecursionError):
+        return None
+    return msg if isinstance(msg, dict) else None
+
+
+def dump(msg):
+    try:
+        return json.dumps(msg, separators=(",", ":")).encode()
+    except (ValueError, RecursionError):
+        return None
 
 
 def peer_uid(conn):
@@ -210,6 +233,7 @@ def main():
     routes = {}   # bridge id -> (socket, the id that connection used)
     next_id = 0
     from_app = b""
+    skipping = False  # inside an app message over MAX_MESSAGE, until its end
 
     def drop(conn):
         clients.pop(conn, None)
@@ -261,20 +285,36 @@ def main():
                     break  # the app closed its end: it is quitting
                 from_app += chunk
                 *messages, from_app = from_app.split(b"\0")
-                if len(from_app) > MAX_PENDING:
-                    from_app = b""
                 out = {}  # socket -> lines to send
+                if skipping:
+                    if messages:
+                        messages.pop(0)  # the end of the message being dropped
+                        skipping = False
+                    else:
+                        from_app = b""
+                if len(from_app) > MAX_MESSAGE:
+                    # Answer the asker with an error rather than leave it waiting.
+                    m = re.match(rb'\{"id":(\d+),', from_app)
+                    route = routes.pop(int(m.group(1)), None) if m else None
+                    if route and route[0] in clients:
+                        out.setdefault(route[0], []).append(dump({"id": route[1], "error": {
+                            "code": -32000, "message": "cdp-bridge: answer over %d MiB dropped" % (MAX_MESSAGE >> 20)}}))
+                    from_app = b""
+                    skipping = True
                 for raw in messages:
-                    try:
-                        msg = json.loads(raw)
-                    except ValueError:
+                    msg = parse(raw)
+                    if msg is None:
                         continue
-                    if isinstance(msg, dict) and "id" in msg:
-                        route = routes.pop(msg["id"], None)
+                    if "id" in msg:
+                        # Only ids this bridge handed out (ints) route anywhere; a
+                        # list or object id raised TypeError and killed the bridge.
+                        route = routes.pop(msg["id"], None) if type(msg["id"]) is int else None
                         if not route or route[0] not in clients:
                             continue
                         msg["id"] = route[1]
-                        out.setdefault(route[0], []).append(json.dumps(msg, separators=(",", ":")).encode())
+                        line = dump(msg)
+                        if line is not None:
+                            out.setdefault(route[0], []).append(line)
                     else:
                         for conn in clients:
                             out.setdefault(conn, []).append(raw)
@@ -297,22 +337,25 @@ def main():
                     drop(conn)
                     continue
                 *lines, rest = (clients[conn] + chunk).split(b"\n")
-                if len(rest) > MAX_PENDING:
+                if len(rest) > MAX_MESSAGE:
                     drop(conn)
                     continue
                 clients[conn] = rest
                 for line in lines:
-                    try:
-                        msg = json.loads(line)
-                    except ValueError:
+                    msg = parse(line)
+                    if msg is None:
                         continue
-                    if not isinstance(msg, dict):
+                    asked = "id" in msg
+                    if asked:
+                        their_id = msg["id"]
+                        msg["id"] = next_id + 1
+                    data = dump(msg)
+                    if data is None:
                         continue
-                    if "id" in msg:
+                    if asked:
                         next_id += 1
-                        routes[next_id] = (conn, msg["id"])
-                        msg["id"] = next_id
-                    to_app(json.dumps(msg, separators=(",", ":")).encode() + b"\0")
+                        routes[next_id] = (conn, their_id)
+                    to_app(data + b"\0")
     finally:
         try:
             os.unlink(path)
