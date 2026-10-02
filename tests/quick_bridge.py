@@ -91,6 +91,30 @@ class BridgeTest(Case):
         self.bridge_up(env=env)
         self.assertEqual(sorted(self.app_events("start")[0]["env"]), ["ELECTRON_IS_DEV"])
 
+    def test_a_connection_that_stops_reading_does_not_stall_the_others(self):
+        self.bridge_up()
+        stuck, other = Conn(self.sock), Conn(self.sock)
+        # More than the socket buffers hold, and never read.
+        stuck.send({"id": 1, "method": "Fake.big", "params": {"bytes": 8_000_000}})
+        time.sleep(0.3)
+        other.send({"id": 1, "method": "Target.getTargets", "params": {}})
+        self.assertEqual(other.recv(timeout=2)["id"], 1)
+        # The stuck one still gets its whole answer once it reads.
+        self.assertEqual(len(stuck.recv(timeout=10)["result"]["blob"]), 8_000_000)
+
+    def test_a_connection_too_far_behind_is_dropped(self):
+        p = self.bridge_up()
+        stuck, other = Conn(self.sock), Conn(self.sock)
+        for i in range(4):  # 96 MB queued for one reader: past the cap
+            stuck.send({"id": i, "method": "Fake.big", "params": {"bytes": 24_000_000}})
+        time.sleep(2)
+        other.send({"id": 5, "method": "Target.getTargets", "params": {}})
+        self.assertEqual(other.recv(timeout=5)["id"], 5)
+        with self.assertRaises((EOFError, ConnectionResetError)):
+            while True:
+                stuck.recv(timeout=10)
+        self.assertIsNone(p.poll(), "the bridge keeps running")
+
 
 def race_once(case):
     """Two bridges started at the same moment (two widget copies waking the

@@ -44,6 +44,12 @@ APP = os.environ.get("NIC_YTM_APP", "/opt/YouTube Music/youtube-music")
 FLAGS_FILE = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
                           "youtube-music-flags.conf")
 MAX_PENDING = 256 * 1024 * 1024  # bytes without a separator before a peer is dropped
+# Bytes waiting to be sent to one connection before it is dropped. Each
+# connection has its own queue and the sockets are non-blocking, so one that
+# stops reading (a hung or stopped client) never holds up the others: a
+# blocking sendall stalled every widget copy and lock-api's quit until that
+# client went away (2026-10-01 review).
+MAX_QUEUED = 64 * 1024 * 1024
 MAX_CLIENTS = 8  # one per monitor copy of the widget, plus a quit from lock-api
 claim = None  # the single-bridge lock, held for the bridge's whole life
 
@@ -200,15 +206,34 @@ def main():
     # connection that asked (every copy counts its ids from 1); events carry
     # no id and go to every connection.
     clients = {}  # socket -> bytes received without a newline yet
+    outq = {}     # socket -> bytes waiting to be sent to it
     routes = {}   # bridge id -> (socket, the id that connection used)
     next_id = 0
     from_app = b""
 
     def drop(conn):
         clients.pop(conn, None)
+        outq.pop(conn, None)
         for rid in [rid for rid, (c, _) in routes.items() if c is conn]:
             del routes[rid]
         conn.close()
+
+    def flush(conn):
+        """Send what the socket takes now; the rest waits for select."""
+        try:
+            sent = conn.send(outq[conn])
+        except BlockingIOError:
+            return
+        except OSError:
+            drop(conn)
+            return
+        del outq[conn][:sent]
+
+    def to_app(data):
+        # A pipe write can be short when a signal lands mid-write.
+        view = memoryview(data)
+        while view:
+            view = view[os.write(to_app_w, view):]
 
     try:
         while not stopping:
@@ -217,15 +242,19 @@ def main():
                 break
             watch = [server, from_app_r] + list(clients)
             try:
-                ready, _, _ = select.select(watch, [], [], 1.0)
+                ready, writable, _ = select.select(watch, [c for c in clients if outq[c]], [], 1.0)
             except InterruptedError:
                 continue
+            for conn in [c for c in writable if c in clients]:
+                flush(conn)
             if server in ready:
                 conn, _ = server.accept()
                 if peer_uid(conn) != os.getuid() or len(clients) >= MAX_CLIENTS:
                     conn.close()
                 else:
+                    conn.setblocking(False)
                     clients[conn] = b""
+                    outq[conn] = bytearray()
             if from_app_r in ready:
                 chunk = os.read(from_app_r, 1 << 20)
                 if not chunk:
@@ -250,13 +279,18 @@ def main():
                         for conn in clients:
                             out.setdefault(conn, []).append(raw)
                 for conn, lines in out.items():
-                    try:
-                        conn.sendall(b"".join(line + b"\n" for line in lines))
-                    except OSError:
+                    if conn not in clients:
+                        continue
+                    outq[conn] += b"".join(line + b"\n" for line in lines)
+                    if len(outq[conn]) > MAX_QUEUED:
                         drop(conn)
+                    else:
+                        flush(conn)
             for conn in [c for c in ready if c in clients]:
                 try:
                     chunk = conn.recv(1 << 20)
+                except BlockingIOError:
+                    continue
                 except OSError:
                     chunk = b""
                 if not chunk:
@@ -278,7 +312,7 @@ def main():
                         next_id += 1
                         routes[next_id] = (conn, msg["id"])
                         msg["id"] = next_id
-                    os.write(to_app_w, json.dumps(msg, separators=(",", ":")).encode() + b"\0")
+                    to_app(json.dumps(msg, separators=(",", ":")).encode() + b"\0")
     finally:
         try:
             os.unlink(path)
