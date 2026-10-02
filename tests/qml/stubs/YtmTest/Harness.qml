@@ -16,7 +16,7 @@ QtObject {
   property var files: ({})
   property var writes: []          // [{path, text}]
   property bool failWrites: false
-  // Processes started (Process.running = true), in order.
+  // Processes started (Process.running = true), in order: [{proc, command}].
   property var procs: []
   // function(command) -> {code, out, err, delay} | null (null: never ends)
   property var procResponder: null
@@ -63,10 +63,13 @@ QtObject {
     else reply({ result: v || {} })
   }
 
+  // Each start is kept as {proc, command}: the command is copied, because a
+  // finished Process may be destroyed by the widget.
   function procStarted(p) {
-    procs = procs.concat([p])
+    var cmd = JSON.parse(JSON.stringify(p.command))
+    procs = procs.concat([{ proc: p, command: cmd }])
     if (!procResponder) return
-    var r = procResponder(p.command)
+    var r = procResponder(cmd)
     if (!r) return
     later(r.delay || 0, function() { finish(p, r.code || 0, r.out || "", r.err || "") })
   }
@@ -79,7 +82,7 @@ QtObject {
     p.exited(code, 0)
   }
   function procsMatching(word) {
-    return procs.filter(function(p) { return JSON.stringify(p.command).indexOf(word) >= 0 })
+    return procs.filter(function(e) { return JSON.stringify(e.command).indexOf(word) >= 0 })
   }
   function detachedMatching(word) {
     return detached.filter(function(a) { return JSON.stringify(a).indexOf(word) >= 0 })

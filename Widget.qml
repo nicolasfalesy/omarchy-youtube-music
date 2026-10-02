@@ -1711,7 +1711,19 @@ Panel {
   property string lyricsSource: ""
   property string lyricsState: ""      // "", loading, ready, none, nosong
   property string lyricsFor: ""
+  // Per song for the session, at most lyricsCacheMax songs: the oldest goes
+  // first (lyricsOrder). It had no cap and grew for the shell's whole life.
   property var lyricsCache: ({})
+  property var lyricsOrder: []
+  readonly property int lyricsCacheMax: 50
+  function keepLyrics(vid, res) {
+    var c = lyricsCache, order = lyricsOrder.filter(function(k) { return k !== vid })
+    c[vid] = res
+    order.push(vid)
+    while (order.length > lyricsCacheMax) delete c[order.shift()]
+    lyricsCache = c
+    lyricsOrder = order
+  }
   property int lyricsSerial: 0
   property int lyricIndex: -1
   property var lyricsFetches: []
@@ -1730,11 +1742,14 @@ Panel {
     var mine = lyricsSerial
     lyricsState = "loading"
     lyricLines = []
+    // A lookup that failed (no network, a timeout, a server error) marks
+    // ctx: what came of it is shown but not kept, so the song is asked again
+    // next time. "No lyrics" from a failed fetch was kept for the shell's
+    // whole life (deep review 2026-10-01). A real "not found" is kept.
+    var ctx = { failed: false }
     var done = function(res) {
       if (mine !== root.lyricsSerial) return
-      var c = root.lyricsCache
-      c[vid] = res
-      root.lyricsCache = c
+      if (!ctx.failed) root.keepLyrics(vid, res)
       root.applyLyrics(res)
     }
     // KuGou and LRCLIB are asked at the same time (KuGou's two steps take
@@ -1749,13 +1764,13 @@ Panel {
       if (words) { done({ synced: true, words: true, lines: words, source: "KuGou" }); return }
       if (lr && lr.synced) { done(lr); return }
       if (!root.appUp) { done(lr || { none: true }); return }
-      root.page("window.__nicYtm.lyrics(" + JSON.stringify(vid) + ")", function(y) {
+      root.page("window.__nicYtm.lyrics(" + JSON.stringify(vid) + ")", function(y, err) {
         if (y && y.text) done({ synced: false, lines: root.plainLines(y.text), source: y.source || "YouTube Music" })
-        else done(lr || { none: true })
+        else { if (err || !y) ctx.failed = true; done(lr || { none: true }) }
       })
     }
-    lrclibLookup(ss, function(lr) { got.lr = lr || null; settle() })
-    kugouLookup(ss, function(kg) { got.kg = kg || null; settle() })
+    lrclibLookup(ss, function(lr) { got.lr = lr || null; settle() }, ctx)
+    kugouLookup(ss, function(kg) { got.kg = kg || null; settle() }, ctx)
   }
   function applyLyrics(res) {
     lyricLines = res && res.lines ? res.lines : []
@@ -1803,7 +1818,7 @@ Panel {
   // (LyricsX, LDDC). There is no zlib in the shell's JS, so inflate() below
   // is a small port of zlib's puff.c. All of it runs only when a song's
   // lyrics are fetched, never at load (see Page.js on why that matters).
-  function kugouLookup(ss, cb) {
+  function kugouLookup(ss, cb, ctx) {
     var enc = encodeURIComponent
     var title = String(ss.title || "")
     var clean = title.replace(/\s*[\(\[](feat\.?|ft\.?|with)[^\)\]]*[\)\]]/ig, "").trim()
@@ -1811,7 +1826,7 @@ Panel {
     var dur = Math.round(Number(ss.songDuration || 0))
     if (!clean || !first) { cb(null); return }
     lyricsGet("https://krcs.kugou.com/search?ver=1&man=yes&client=mobi&keyword=" + enc(first + " - " + clean)
-      + "&duration=" + (dur * 1000) + "&hash=", function(d) {
+      + "&duration=" + (dur * 1000) + "&hash=", ctx, function(d) {
         // Only a candidate with the same title and artist and a length within
         // 3 s: a wrong song's words are worse than LRCLIB's lines.
         var best = null, cs = d && d.candidates ? d.candidates : []
@@ -1824,7 +1839,7 @@ Panel {
         }
         if (!best) { cb(null); return }
         root.lyricsGet("https://lyrics.kugou.com/download?ver=1&client=pc&fmt=krc&charset=utf8&id=" + enc(best.c.id)
-          + "&accesskey=" + enc(best.c.accesskey), function(x) {
+          + "&accesskey=" + enc(best.c.accesskey), ctx, function(x) {
             var lines = null
             try {
               if (x && x.content) lines = root.parseKrc(root.krcText(x.content), clean, first)
@@ -2167,29 +2182,48 @@ Panel {
       id: fetchProc
       property var done: null
       stdout: StdioCollector { id: fetchOut; waitForEnd: true }
-      onExited: function(exitCode) { root.lyricsFetched(fetchProc, exitCode === 0 ? fetchOut.text : "") }
+      // curl's own error line, then the HTTP status (-w %{stderr}).
+      stderr: StdioCollector { id: fetchErr; waitForEnd: true }
+      onExited: function(exitCode) { root.lyricsFetched(fetchProc, exitCode === 0 ? fetchOut.text : "", exitCode, fetchErr.text) }
     }
   }
-  function lyricsGet(url, cb) {
-    var cmd = ["curl", "-fsS", "--proto", "=https", "--max-time", "8", "--max-filesize", String(root.lyricsMaxBytes)]
+  // ctx (optional) is marked failed when this fetch failed for any reason but
+  // the service saying "not found" (see loadLyrics).
+  function lyricsGet(url, ctx, cb) {
+    var cmd = ["curl", "-fsS", "--proto", "=https", "--max-time", "8", "--max-filesize", String(root.lyricsMaxBytes),
+      "-w", "%{stderr}%{http_code}\n"]
     // LRCLIB asks clients to name themselves.
     if (url.indexOf("https://lrclib.net/") === 0)
       cmd = cmd.concat(["-H", "Lrclib-Client: nic.youtube-music (Omarchy bar widget)"])
-    var p = lyricsFetch.createObject(root, { command: cmd.concat(["--", url]), done: cb })
+    // ctx rides in the closure: an object handed to createObject arrives as a
+    // copy, so marking it there never reached loadLyrics.
+    var p = lyricsFetch.createObject(root, { command: cmd.concat(["--", url]),
+      done: function(d, failed) { if (failed && ctx) ctx.failed = true; cb(d) } })
     root.lyricsFetches = root.lyricsFetches.concat([p])
     p.running = true
     lyricsTimeout.restart()
   }
-  function lyricsFetched(p, text) {
+  // A fetch counts as an answer when curl succeeded, or when the service said
+  // the song is not there (HTTP 4xx, except 408 and 429, which only mean
+  // "later"). Anything else (exit 6/7 no network, 28 timeout, 63 too big, a
+  // 5xx, a kill by lyricsTimeout) is a failure.
+  function lyricsFetchFailed(code, err) {
+    if (code === 0) return false
+    var lines = String(err || "").trim().split("\n")
+    var http = Number(lines[lines.length - 1])
+    return !(code === 22 && http >= 400 && http < 500 && http !== 408 && http !== 429)
+  }
+  function lyricsFetched(p, text, code, err) {
     root.lyricsFetches = root.lyricsFetches.filter(function(o) { return o !== p })
     if (!root.lyricsFetches.length) lyricsTimeout.stop()
     var d = null
     if (text) { try { d = JSON.parse(text) } catch (e) {} }
+    var failed = root.lyricsFetchFailed(code, err) || (code === 0 && !d)
     var cb = p.done
     p.done = null
     // Not destroyed from inside its own exited handler.
     Qt.callLater(function() { p.destroy() })
-    if (cb) cb(d)
+    if (cb) cb(d, failed)
   }
   // A lookup that hangs (a dead connection after a network change, see
   // ArtImage) is given up 8 s after the last one started, and the next
@@ -2198,21 +2232,21 @@ Panel {
     id: lyricsTimeout; interval: 8000
     onTriggered: { var ps = root.lyricsFetches; for (var i = 0; i < ps.length; i++) ps[i].running = false }
   }
-  function lrclibLookup(ss, cb) {
+  function lrclibLookup(ss, cb, ctx) {
     var q = function(k, v) { return k + "=" + encodeURIComponent(v) }
     var title = String(ss.title || "")
     var artist = String(ss.artist || "")
     var dur = Math.round(Number(ss.songDuration || 0))
     var url = "https://lrclib.net/api/get?" + q("artist_name", artist) + "&" + q("track_name", title)
       + (ss.album ? "&" + q("album_name", ss.album) : "") + (dur > 0 ? "&" + q("duration", dur) : "")
-    lyricsGet(url, function(d) {
+    lyricsGet(url, ctx, function(d) {
       var plain = d && d.plainLyrics ? { synced: false, lines: root.plainLines(d.plainLyrics), source: "LRCLIB" } : null
       if (d && d.syncedLyrics) { cb({ synced: true, lines: root.parseLrc(d.syncedLyrics), source: "LRCLIB" }); return }
       // No exact match: search by a cleaned title and the first artist, and
       // take the closest length within 3 s that has timed lines.
       var clean = title.replace(/\s*[\(\[](feat\.?|ft\.?|with)[^\)\]]*[\)\]]/ig, "").trim()
       var first = artist.split(/\s*(?:,|&| x | feat\.? | ft\.? )\s*/i)[0]
-      root.lyricsGet("https://lrclib.net/api/search?" + q("track_name", clean) + "&" + q("artist_name", first), function(list) {
+      root.lyricsGet("https://lrclib.net/api/search?" + q("track_name", clean) + "&" + q("artist_name", first), ctx, function(list) {
         var best = null
         if (list && list.length) for (var i = 0; i < list.length; i++) {
           var e = list[i]
