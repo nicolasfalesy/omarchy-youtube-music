@@ -67,7 +67,8 @@ Panel {
   ipcTarget: "nic.youtube-music"
   manageIpc: false
 
-  readonly property string api: "http://127.0.0.1:26538/api/v1"
+  readonly property int apiPort: 26538
+  readonly property string api: "http://127.0.0.1:" + apiPort + "/api/v1"
   readonly property string appClass: "com.github.th-ch.youtube-music"
   // Its own folder, not ~/.local/state/omarchy itself: the shell watches three
   // folders there (toggles, indicators, current), and a FileView on a folder
@@ -435,7 +436,8 @@ Panel {
       cb(x.status, data)
     }
     x.open(method, root.api + path)
-    if (root.apiToken) x.setRequestHeader("Authorization", "Bearer " + root.apiToken)
+    // Only to a port known to be this user's app (see portTrusted).
+    if (root.apiToken && root.portTrusted) x.setRequestHeader("Authorization", "Bearer " + root.apiToken)
     if (body !== undefined && body !== null) {
       x.setRequestHeader("Content-Type", "application/json")
       x.send(JSON.stringify(body))
@@ -1097,7 +1099,7 @@ Panel {
   }
 
   // ------------------------------------------------------------ live state socket
-  readonly property string wsUrl: "ws://127.0.0.1:26538/api/v1/ws"
+  readonly property string wsUrl: "ws://127.0.0.1:" + apiPort + "/api/v1/ws"
   WebSocket {
     id: live
     // url is set by probe(), not bound. The token file loads a moment after
@@ -1107,6 +1109,8 @@ Panel {
     active: false
     onStatusChanged: {
       if (live.status === WebSocket.Open) {
+        // Something listens on the port (see portTrusted).
+        if (!root.appUp) root.liveAnswered = true
         // Not "up" yet. With the app's auth on and a missing or stale token,
         // the app accepts the socket and then closes it at once (1008,
         // api-server onOpen). Marking the app up here made every such
@@ -1119,6 +1123,8 @@ Panel {
       } else if (live.status === WebSocket.Closed || live.status === WebSocket.Error) {
         var wasUp = root.appUp
         if (wasUp) {
+          // Whoever listens next is checked again.
+          root.portTrusted = false
           root.saveLast()
           root.appUp = false
           root.isPlaying = false
@@ -1134,6 +1140,10 @@ Panel {
           root.reportedPosition = root.position
         }
         active = false
+        // A listener closed a probe that went without the token (the app's
+        // auth refusing it, 1008): find out whose it is before the token goes.
+        if (!wasUp && root.liveAnswered && !root.liveWithToken && root.apiToken !== "" && !root.portTrusted)
+          root.checkPortOwner()
         // No retry.restart() here. This handler runs outside the timer's own
         // tick, and restart() re-arms triggeredOnStart, so every refused
         // connect queued the next one at once: about 44,000 connects a second
@@ -1319,9 +1329,47 @@ Panel {
     // seen by the watch, so look again on each probe while there is none.
     if (!apiToken) tokenFile.reload()
     if (live.status === WebSocket.Open || live.status === WebSocket.Connecting) return
+    var tok = apiToken !== "" && portTrusted
     live.active = false
-    live.url = root.wsUrl + (root.apiToken ? "?token=" + encodeURIComponent(root.apiToken) : "")
+    liveWithToken = tok
+    liveAnswered = false
+    live.url = root.wsUrl + (tok ? "?token=" + encodeURIComponent(root.apiToken) : "")
     live.active = true
+  }
+  // The token goes only to a port that belongs to this user. While the app
+  // is closed the port is free, and any program of any user could listen
+  // there and collect the token from the widget's probes (every 20 s, deep
+  // review 2026-10-01; on a one-user laptop only a system service's account
+  // could). So probes go without the token until something answers on the
+  // port: the app with its auth on accepts that socket and closes it (1008).
+  // Then `ss -e` names the uid of every socket listening there, and only when
+  // all of them are this user's (`id -u`) does the next probe carry the
+  // token. ss leaves out uid 0, so root's listener never passes. One check
+  // per app start, none while the app is closed; trust ends when the app
+  // goes. An app whose API is still open (auth NONE) comes up through the
+  // token-less probe and never needs the token. The REST calls send it only
+  // while trusted too.
+  property bool portTrusted: false
+  property bool liveWithToken: false
+  property bool liveAnswered: false
+  function checkPortOwner() { if (!portCheck.running) portCheck.running = true }
+  function portOwnedByMe(t) {
+    var ls = String(t || "").split("\n").map(function(l) { return l.trim() }).filter(function(l) { return l !== "" })
+    if (ls.length < 2 || !/^[0-9]+$/.test(ls[0])) return false
+    for (var i = 1; i < ls.length; i++) {
+      var m = /(?:^|\s)uid:([0-9]+)(?:\s|$)/.exec(ls[i])
+      if (!m || m[1] !== ls[0]) return false
+    }
+    return true
+  }
+  Process {
+    id: portCheck
+    command: ["sh", "-c", "id -u; exec ss -ltnHe 'sport = :" + root.apiPort + "'"]
+    stdout: StdioCollector { id: portOut; waitForEnd: true }
+    onExited: function(exitCode) {
+      root.portTrusted = exitCode === 0 && root.portOwnedByMe(portOut.text)
+      if (root.portTrusted && !root.appUp) root.probe()
+    }
   }
   // The app was started by hand: probe every second for 20 s, since its API
   // comes up a moment after its window.
