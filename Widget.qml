@@ -448,6 +448,10 @@ Panel {
   function cmd(path, body) { call("POST", path, body === undefined ? null : body, null) }
 
   function hasLast() { return !!(lastSong && lastSong.videoId) }
+  // Milliseconds since t. A time in the future means the clock was stepped
+  // back (NTP after a sleep, a manual change), and the age is then unknown:
+  // it counts as long ago (Infinity), never as "just now".
+  function ageMs(t) { var a = Date.now() - t; return a < 0 ? Infinity : a }
   // Nothing of the user's is loaded in the player: the app is closed, or it holds
   // only YouTube Music's restored cue while a song is remembered, or it holds
   // nothing at all. Play, next and previous then start or resume instead: the
@@ -1335,7 +1339,12 @@ Panel {
     // seen by the watch, so look again on each probe while there is none
     // (or while the app turns the one we have down).
     if (!apiToken || tokenRejected) tokenFile.reload()
+    // A connect that never finishes (something took the TCP connection and
+    // never answered the WebSocket handshake) blocked every later probe for
+    // good. Past connectTimeoutMs it is dropped and this probe goes ahead.
+    if (live.status === WebSocket.Connecting && ageMs(liveSince) > connectTimeoutMs) live.active = false
     if (live.status === WebSocket.Open || live.status === WebSocket.Connecting) return
+    liveSince = Date.now()
     var tok = apiToken !== "" && portTrusted && !tokenRejected
     live.active = false
     liveWithToken = tok
@@ -1357,6 +1366,8 @@ Panel {
   // token-less probe and never needs the token. The REST calls send it only
   // while trusted too.
   property bool portTrusted: false
+  property double liveSince: 0
+  property int connectTimeoutMs: 10000
   property bool liveWithToken: false
   property bool liveAnswered: false
   function checkPortOwner() { if (!portCheck.running) portCheck.running = true }

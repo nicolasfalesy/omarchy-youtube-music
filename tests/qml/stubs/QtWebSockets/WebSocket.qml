@@ -10,9 +10,11 @@ QtObject {
   property bool active: false
   property int status: WebSocket.Closed
   signal textMessageReceived(string message)
-  onActiveChanged: if (active) {
-    status = WebSocket.Connecting
-    Harness.sockets = Harness.sockets.concat([{ ws: ws, url: String(url) }])
+  onActiveChanged: {
+    if (active) {
+      status = WebSocket.Connecting
+      Harness.sockets = Harness.sockets.concat([{ ws: ws, url: String(url) }])
+    } else if (status !== WebSocket.Closed) status = WebSocket.Closed
   }
   function open() { status = WebSocket.Open }
   function push(obj) { textMessageReceived(JSON.stringify(obj)) }
