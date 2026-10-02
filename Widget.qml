@@ -865,14 +865,23 @@ Panel {
     // Before 2026-09-24 the file sat at ~/.local/state/omarchy/nic-youtube-music-last.json
     // (see stateDir for why it moved). Read the old one once when the new one
     // is missing, and carry it over, so the remembered song survives the move.
-    onLoadFailed: oldLastFile.path = Quickshell.env("HOME") + "/.local/state/omarchy/nic-youtube-music-last.json"
+    onLoadFailed: oldLastFile.path = root.legacyLastPath
+    // The carried-over copy is written: the old file goes, so it is not read
+    // (or left behind) again. Only after a good write.
+    onSaved: if (root.migratingLast) { root.migratingLast = false; Quickshell.execDetached(["rm", "-f", "--", root.legacyLastPath]) }
+    onSaveFailed: root.migratingLast = false
   }
+  readonly property string legacyLastPath: Quickshell.env("HOME") + "/.local/state/omarchy/nic-youtube-music-last.json"
+  property bool migratingLast: false
   FileView {
     id: oldLastFile
     path: ""
     watchChanges: false
     printErrors: false
-    onLoaded: if (root.takeLast(text()) && root.isPrimary()) lastFile.setText(JSON.stringify(root.lastSong, null, 2) + "\n")
+    onLoaded: if (root.takeLast(text()) && root.isPrimary()) {
+      root.migratingLast = true
+      lastFile.setText(JSON.stringify(root.lastSong, null, 2) + "\n")
+    }
   }
   Timer {
     id: saveTimer
