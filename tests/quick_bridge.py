@@ -90,3 +90,33 @@ class BridgeTest(Case):
         env = dict(self.env, NODE_OPTIONS="--inspect=127.0.0.1:9229", ELECTRON_RUN_AS_NODE="1")
         self.bridge_up(env=env)
         self.assertEqual(sorted(self.app_events("start")[0]["env"]), ["ELECTRON_IS_DEV"])
+
+
+def race_once(case):
+    """Two bridges started at the same moment (two widget copies waking the
+    app, or the menu entry and a wake). Exactly one app must start, nothing may
+    crash, and the socket must answer."""
+    first, second = case.start_bridge(), case.start_bridge()
+    case.assertTrue(wait_until(lambda: os.path.exists(case.sock) and case.app_events("start")))
+    time.sleep(0.5)  # a second app, if any, has started by now
+    starts = len(case.app_events("start"))
+    errs = ""
+    for p in (first, second):
+        with open(p.errfile, errors="replace") as f:
+            errs += f.read()
+    c = Conn(case.sock)
+    c.send({"id": 1, "method": "Target.getTargets", "params": {}})
+    answered = c.recv()["id"] == 1
+    c.send({"id": 2, "method": "Browser.close", "params": {}})
+    c.close()
+    for p in (first, second):
+        p.wait(timeout=10)
+    return starts, "Traceback" in errs, answered
+
+
+class BridgeRaceTest(Case):
+    def test_two_bridges_at_once_start_one_app(self):
+        for _ in range(3):
+            self.tearDown()
+            self.setUp()
+            self.assertEqual(race_once(self), (1, False, True))

@@ -29,6 +29,7 @@ Started by the widget when the app is needed, and by the app's menu entry
 (tools/setup installs one), so the app is never started with an open port.
 """
 
+import fcntl
 import json
 import os
 import select
@@ -44,6 +45,7 @@ FLAGS_FILE = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduse
                           "youtube-music-flags.conf")
 MAX_PENDING = 256 * 1024 * 1024  # bytes without a separator before a peer is dropped
 MAX_CLIENTS = 8  # one per monitor copy of the widget, plus a quit from lock-api
+claim = None  # the single-bridge lock, held for the bridge's whole life
 
 
 def die(msg, code=1):
@@ -123,8 +125,24 @@ def main():
     d = private_dir()
     path = os.path.join(d, "cdp.sock")
 
-    # One bridge (so one app) at a time. A socket that answers means it runs.
-    if os.path.exists(path):
+    # One bridge (so one app) at a time, claimed BEFORE the app starts. The
+    # claim is an exclusive lock on a file in the private folder: taking it is
+    # atomic, and the kernel drops it when the bridge dies, so it never goes
+    # stale. A check-then-bind let two bridges started together both start an
+    # app; the loser then crashed on bind (EADDRINUSE) and, with the real app,
+    # the single-instance lock could keep the app that had no bridge
+    # (2026-10-01 review: 18 of 20 double starts). The lock is never passed
+    # to the app (opened close-on-exec).
+    global claim
+    claim = os.open(os.path.join(d, "bridge.lock"),
+                    os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        fcntl.flock(claim, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return 0  # another bridge runs, or is starting
+    # A socket left behind is stale (its bridge is gone), unless it answers:
+    # a bridge from before this lock existed may still be serving it.
+    if os.path.lexists(path):
         probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             probe.connect(path)
@@ -132,6 +150,14 @@ def main():
             return 0
         except OSError:
             os.unlink(path)
+    old_umask = os.umask(0o177)
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        server.bind(path)
+    finally:
+        os.umask(old_umask)
+    os.chmod(path, 0o600)
+    server.listen(4)
 
     to_app_r, to_app_w = os.pipe()        # app reads commands on fd 3
     from_app_r, from_app_w = os.pipe()    # app writes answers on fd 4
@@ -157,13 +183,6 @@ def main():
             os._exit(127)
     os.close(to_app_r)
     os.close(from_app_w)
-
-    old_umask = os.umask(0o177)
-    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    server.bind(path)
-    os.umask(old_umask)
-    os.chmod(path, 0o600)
-    server.listen(4)
 
     stopping = []
     # Never forward a TERM to the app: Chromium crashes on purpose on SIGTERM.
