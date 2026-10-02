@@ -207,6 +207,11 @@ def app_env(app):
     # Node's own switches reach the app's main process through these too.
     for name in ("NODE_OPTIONS", "ELECTRON_RUN_AS_NODE"):
         env.pop(name, None)
+    # Name the app's sound streams "YouTube Music". The source package runs as
+    # plain electron, the same program name as other Electron apps (Obsidian),
+    # so a sound-server rule cannot tell them apart by name; libpulse puts this
+    # on the app's connection, over whatever name Chromium sets.
+    env["PULSE_PROP_OVERRIDE"] = 'application.name="YouTube Music" application.icon_name="com.github.th-ch.youtube-music"'
     return env
 
 

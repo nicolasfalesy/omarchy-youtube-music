@@ -38,7 +38,7 @@ import time
 LOG = os.environ.get("FAKE_LOG", "")
 CTL = os.environ.get("FAKE_CTL", "")
 CFG = os.path.join(os.environ["HOME"], ".config", "YouTube Music", "config.json")
-ENV_NAMES = ("NODE_OPTIONS", "ELECTRON_RUN_AS_NODE", "ELECTRON_IS_DEV", "ELECTRON_FORCE_IS_PACKAGED", "FAKE_API")
+ENV_NAMES = ("NODE_OPTIONS", "ELECTRON_RUN_AS_NODE", "ELECTRON_IS_DEV", "ELECTRON_FORCE_IS_PACKAGED", "FAKE_API", "PULSE_PROP_OVERRIDE")
 lock = threading.Lock()
 
 

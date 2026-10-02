@@ -100,7 +100,14 @@ class BridgeTest(Case):
     def test_node_environment_switches_are_dropped(self):
         env = dict(self.env, NODE_OPTIONS="--inspect=127.0.0.1:9229", ELECTRON_RUN_AS_NODE="1")
         self.bridge_up(env=env)
-        self.assertEqual(sorted(self.app_events("start")[0]["env"]), ["ELECTRON_IS_DEV"])
+        self.assertEqual(sorted(self.app_events("start")[0]["env"]), ["ELECTRON_IS_DEV", "PULSE_PROP_OVERRIDE"])
+
+    def test_sound_streams_are_named_youtube_music(self):
+        # The source package runs as plain "electron" (like other Electron
+        # apps), so a sound-server rule cannot match the program name: the
+        # bridge names the app's streams itself.
+        self.bridge_up()
+        self.assertIn("PULSE_PROP_OVERRIDE", self.app_events("start")[0]["env"])
 
     def test_a_connection_that_stops_reading_does_not_stall_the_others(self):
         self.bridge_up()
