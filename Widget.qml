@@ -629,6 +629,13 @@ Panel {
     starting = false
     startFailed = true
     pendingAction = ""
+    // The panel says so itself; with it closed, a notification does.
+    if (!setupRunning && !anyCopyOpen()) toastFor("YouTube Music didn't start. Try again, or start the YouTube Music app from the launcher.", 6000)
+  }
+  function anyCopyOpen() {
+    var ps = peers()
+    for (var i = 0; i < ps.length; i++) if (ps[i] && ps[i].opened) return true
+    return opened
   }
   Timer {
     id: startTimeout
@@ -1412,7 +1419,8 @@ Panel {
       pendingAction = ""
     }
     if (launchedApp) { launchedApp = false; quitApp() }
-    if (!opened) toastFor(tokenRejectedText, 8000)
+    // The panel shows it on its Set up screen; with no panel open, a notification.
+    if (!anyCopyOpen()) toastFor(tokenRejectedText, 8000)
   }
   readonly property string tokenRejectedText: "YouTube Music turned down this widget's key. Open the panel and run Set up again."
   function portOwnedByMe(t) {
@@ -2871,7 +2879,20 @@ Panel {
 
   property string toastText: ""
   function toast(t) { toastFor(t, 2600) }
-  function toastFor(t, ms) { toastText = t; toastTimer.interval = ms; toastTimer.restart() }
+  // A message shows in the toast of whichever monitor's panel is open. With
+  // no panel open it was drawn in a closed panel and nobody saw it (a play
+  // from the bar or a media key on an app that is not set up, a song that
+  // is gone, a start that failed; deep review 2026-10-01). It is then a plain
+  // desktop notification: the text is notify-send's summary, which the
+  // notification spec defines as plain text, passed as one argument after
+  // "--", so nothing in a song title reads as an option.
+  function toastFor(t, ms) {
+    var ps = peers()
+    for (var i = 0; i < ps.length; i++) if (ps[i] && ps[i] !== root && ps[i].opened) { ps[i].showToast(t, ms); return }
+    if (opened) { showToast(t, ms); return }
+    Quickshell.execDetached(["notify-send", "--app-name=YouTube Music", "--", String(t)])
+  }
+  function showToast(t, ms) { toastText = t; toastTimer.interval = ms; toastTimer.restart() }
   Timer { id: toastTimer; interval: 2600; onTriggered: root.toastText = "" }
 
   function fmt(sec) {
