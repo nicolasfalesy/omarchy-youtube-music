@@ -3656,7 +3656,6 @@ Panel {
                   anchors.fill: parent
                   radius: width / 2
                   color: Color.accent
-                  opacity: root.hasSong ? 1 : 0.4
                   scale: playMouse.pressed ? 0.92 : (playMouse.containsMouse ? 1.05 : 1)
                   Behavior on scale { NumberAnimation { duration: 110; easing.type: Easing.OutCubic } }
                   Text {
@@ -3671,13 +3670,16 @@ Panel {
                 }
                 MouseArea {
                   id: playMouse
+                  objectName: "roundPlay"
                   anchors.fill: parent
                   hoverEnabled: true
-                  enabled: root.hasSong
+                  // Always on: with nothing loaded or remembered, play starts
+                  // Liked songs, as a right click on the bar and the play key
+                  // do (it was dimmed and disabled then).
                   cursorShape: Qt.PointingHandCursor
                   onClicked: root.playPause()
                 }
-                HoverTip { shown: playMouse.containsMouse; text: root.isPlaying ? "Pause" : "Play" }
+                HoverTip { shown: playMouse.containsMouse; text: root.isPlaying ? "Pause" : (root.hasSong ? "Play" : "Play Liked songs") }
               }
               IconBtn {
                 anchors.verticalCenter: parent.verticalCenter
