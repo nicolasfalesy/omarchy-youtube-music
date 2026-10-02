@@ -211,6 +211,9 @@ def app_env(app):
     # plain electron, the same program name as other Electron apps (Obsidian),
     # so a sound-server rule cannot tell them apart by name; libpulse puts this
     # on the app's connection, over whatever name Chromium sets.
+    # Known and accepted (2026-10-02): these variables also reach anything the
+    # app itself starts (its xdg-open for a help link), so a browser started
+    # that way would label its own sound "YouTube Music". Rare and harmless.
     env["PULSE_PROP_OVERRIDE"] = 'application.name="YouTube Music" application.icon_name="com.github.th-ch.youtube-music"'
     return env
 

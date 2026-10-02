@@ -1201,6 +1201,11 @@ Panel {
         // onTextMessageReceived).
       } else if (live.status === WebSocket.Closed || live.status === WebSocket.Error) {
         var wasUp = root.appUp
+        // Trust in the port's owner ends whenever a connection that carried the
+        // token closes, not only after the app was up: it can quit or crash
+        // between the owner check and its first message (cold reviewer,
+        // 2026-10-02), and the next listener must be checked again.
+        if (!wasUp && root.liveWithToken) root.portTrusted = false
         if (wasUp) {
           // Whoever listens next is checked again.
           root.portTrusted = false
@@ -1471,6 +1476,8 @@ Panel {
     tokenRefusals += 1
     if (tokenRefusals < 2 || tokenRejected) return
     tokenRejected = true
+    // A new token (Set up again) must not go to an unchecked listener.
+    portTrusted = false
     if (starting) {
       startTimeout.stop()
       starting = false

@@ -131,7 +131,7 @@ Comment=YouTube Music, started for the nic.youtube-music bar widget (private deb
 Exec="$here/cdp-bridge" %U
 Terminal=false
 Type=Application
-Icon=youtube-music
+Icon=com.github.th-ch.youtube-music
 StartupWMClass=com.github.th-ch.youtube-music
 Categories=AudioVideo;
 EOF
