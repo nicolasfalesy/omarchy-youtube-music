@@ -28,7 +28,9 @@ class H(http.server.BaseHTTPRequestHandler):
             return self.send_json(stats)
         if self.path == "/api/v1/like-state":
             return self.send_json({"state": "LIKE"})
-        if self.path == "/api/v1/slow":
+        if self.path == "/api/v1/volume":
+            return self.send_json({"state": 50})
+        if self.path in ("/api/v1/slow", "/api/v1/slow-prefix/volume"):
             time.sleep(0.3)
             return self.send_json({"state": "LIKE"})
         if self.path == "/api/v1/endless":

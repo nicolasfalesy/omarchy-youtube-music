@@ -456,7 +456,8 @@ Panel {
   // Shared with every call still on its way; marked when the widget goes.
   readonly property var life: ({ alive: true })
   Component.onDestruction: life.alive = false
-  function call(method, path, body, cb) {
+  // noToken: send no Authorization header even when one is trusted.
+  function call(method, path, body, cb, noToken) {
     var x = new XMLHttpRequest()
     var cap = root.restMaxChars, life = root.life, over = false, answered = false
     var stop = function() { if (over) return; over = true; Qt.callLater(function() { x.abort() }) }
@@ -476,7 +477,7 @@ Panel {
     }
     x.open(method, root.api + path)
     // Only to a port known to be this user's app (see portTrusted).
-    if (root.apiToken && root.portTrusted) x.setRequestHeader("Authorization", "Bearer " + root.apiToken)
+    if (root.apiToken && root.portTrusted && !noToken) x.setRequestHeader("Authorization", "Bearer " + root.apiToken)
     if (body !== undefined && body !== null) {
       x.setRequestHeader("Content-Type", "application/json")
       x.send(JSON.stringify(body))
@@ -1375,15 +1376,14 @@ Panel {
   // on the local network: the API allows every origin) can drive the signed-in
   // account, so the panel says how to lock it.
   property bool apiOpen: false
+  // Through call(), without the token: its size cap and its check that the
+  // widget is still there apply (an answer after a shell reload threw a
+  // TypeError on the destroyed widget).
   function checkApiLock() {
-    var x = new XMLHttpRequest()
-    x.onreadystatechange = function() {
-      if (x.readyState !== XMLHttpRequest.DONE) return
-      root.apiOpen = x.status === 200
+    call("GET", "/volume", null, function(status) {
+      root.apiOpen = status === 200
       if (root.apiOpen && root.opened) root.warnApiOpen()
-    }
-    x.open("GET", root.api + "/volume")
-    x.send()
+    }, true)
   }
   // Points at the panel's own Set up (a button in the toast), not at a
   // terminal step: the panel has done setup itself since 2.4.0.
