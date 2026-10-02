@@ -69,6 +69,25 @@ replace_with() {
 set_strategy() {
   replace_with "$cfg" 600 jq --arg s "$1" '.plugins["api-server"].authStrategy = $s' "$cfg"
 }
+# The closing write: AUTH_AT_FIRST, and in the same write the authorized
+# clients. After a mint, only the new id stays: ids from older tokens or
+# other clients kept working against the app until dropped (2026-10-01
+# review). After a failed mint, the id it asked for is taken out again and
+# the rest is left as it was. The id goes to jq through the environment
+# (readable by this user only), not its arguments.
+lock_config() {
+  local filter='.plugins["api-server"].authStrategy = "AUTH_AT_FIRST"'
+  if (( minted )); then
+    filter+=' | .plugins["api-server"].authorizedClients = [env.NIC_YTM_ID]'
+  elif [[ -n ${id:-} ]]; then
+    filter+=' | .plugins["api-server"].authorizedClients = ((.plugins["api-server"].authorizedClients // []) - [env.NIC_YTM_ID])'
+  fi
+  NIC_YTM_ID=${id:-} replace_with "$cfg" 600 jq "$filter" "$cfg"
+}
+clients_ok() {
+  (( minted )) || return 0
+  NIC_YTM_ID=$id jq -e '.plugins["api-server"].authorizedClients == [env.NIC_YTM_ID]' "$cfg" >/dev/null 2>&1
+}
 # What config.json says now, read back rather than assumed from a write.
 # A missing authStrategy is the app's own default, AUTH_AT_FIRST (pear-desktop
 # 3.12 api-server defaults). Reading it as NONE left a fresh install's API
@@ -105,8 +124,8 @@ close_api() {
   # Checked explicitly: close_api runs under `if !`, where set -e is off, so a
   # failed write would otherwise fall through to "Locked" and leave NONE for
   # the next launch (review #8595, 2026-09-28).
-  if ! set_strategy AUTH_AT_FIRST || ! strategy_is AUTH_AT_FIRST; then
-    echo "NOT LOCKED: could not write authStrategy AUTH_AT_FIRST to $cfg, so the app's next start would answer anyone." >&2
+  if ! lock_config || ! strategy_is AUTH_AT_FIRST || ! clients_ok; then
+    echo "NOT LOCKED: could not write authStrategy AUTH_AT_FIRST (and the authorized clients) to $cfg, so the app's next start would answer anyone." >&2
     echo "Check the file can be written (disk space, permissions), then run this again." >&2
     return 1
   fi
@@ -119,7 +138,7 @@ close_api() {
 
 # Runs on every exit once the API may be open, including the normal one: the
 # lock and the "Locked" message both come from here, after close_api checked.
-opened=0 minted=0
+opened=0 minted=0 id=
 lock_on_exit() {
   local rc=$?
   trap - EXIT INT TERM HUP

@@ -184,3 +184,20 @@ class LockApiTest(Case):
         self.assertFalse(token_id(token) in seen, "the client id was on curl's command line")
         self.assertTrue([e for e in self.app_events("api") if e.get("bearer")],
                         "the new token was checked against the API")
+
+    def test_only_the_new_token_stays_authorized(self):
+        # Ids authorized before (old tokens, stray clients) keep working
+        # against the app until they are dropped from authorizedClients.
+        self.config(clients=["stray-old-id", "another-client"])
+        rc, _, err = self.lock()
+        self.assertEqual(rc, 0, err)
+        api = self.read_config()["plugins"]["api-server"]
+        self.assertEqual(api["authorizedClients"], [token_id(self.read_token())])
+        self.assertEqual(api["authStrategy"], "AUTH_AT_FIRST")
+
+    def test_a_failed_mint_leaves_the_authorized_list_alone(self):
+        self.config(clients=["kept-client"])
+        self.ctl_on("mint_empty")
+        rc, _, _ = self.lock()
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.read_config()["plugins"]["api-server"]["authorizedClients"], ["kept-client"])
