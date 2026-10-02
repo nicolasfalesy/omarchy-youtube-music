@@ -583,12 +583,34 @@ Panel {
     id: launchTimer
     interval: 600
     // Through the bridge, so the app runs with the private pipe and no port.
-    onTriggered: if (!root.appUp) Quickshell.execDetached(["setsid", "-f", root.bridgePath])
+    onTriggered: if (!root.appUp && !launcher.running) launcher.running = true
+  }
+  // The bridge runs in a session of its own (setsid), so a shell restart never
+  // takes the app down, as with the `setsid -f` this replaces. But that gave
+  // no word when the bridge stopped at once (no python3, a broken runtime
+  // folder, a second bridge racing it): the panel said "Waking up" for the
+  // whole 40 s start timeout (deep review 2026-10-01). So a small sh watches
+  // it for its first 5 s and passes on its exit status if it ends by then;
+  // a bridge still running after that is left alone and the sh exits 0.
+  Process {
+    id: launcher
+    command: ["sh", "-c", "setsid \"$0\" </dev/null >/dev/null 2>&1 & p=$!; "
+      + "for i in 1 2 3 4 5 6 7 8 9 10; do sleep 0.5; kill -0 \"$p\" 2>/dev/null || { wait \"$p\"; exit $?; }; done; exit 0",
+      root.bridgePath]
+    onExited: function(exitCode) {
+      if (exitCode !== 0 && !root.appUp && root.starting) root.startFailedNow()
+    }
+  }
+  function startFailedNow() {
+    startTimeout.stop()
+    starting = false
+    startFailed = true
+    pendingAction = ""
   }
   Timer {
     id: startTimeout
     interval: 40000
-    onTriggered: if (!root.appUp) { root.starting = false; root.startFailed = true; root.pendingAction = "" }
+    onTriggered: if (!root.appUp) root.startFailedNow()
   }
 
   // The API socket opens before the page has finished loading, so wait for
