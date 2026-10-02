@@ -44,6 +44,7 @@ import socket
 import stat
 import struct
 import sys
+import syslog
 import time
 from urllib.parse import urlsplit
 
@@ -65,8 +66,20 @@ MAX_CLIENTS = 8  # one per monitor copy of the widget, plus a quit from lock-api
 claim = None  # the single-bridge lock, held for the bridge's whole life
 
 
-def die(msg, code=1):
+def say(msg, priority=syslog.LOG_WARNING):
+    """To stderr and to the journal (syslog, ident cdp-bridge). The widget
+    starts the bridge detached with stderr on /dev/null, so stderr alone left
+    a failed start with no trace anywhere (2026-10-01 review). The app's own
+    output stays on /dev/null."""
     print("cdp-bridge: " + msg, file=sys.stderr)
+    try:
+        syslog.syslog(priority, msg)
+    except OSError:
+        pass
+
+
+def die(msg, code=1):
+    say(msg, syslog.LOG_ERR)
     sys.exit(code)
 
 
@@ -103,8 +116,8 @@ def keep(words, source):
     out = []
     for word in words:
         if opens_debugging(word):
-            print("cdp-bridge: ignoring " + word.split("=", 1)[0] + " from " + source
-                  + " (the debugging channel is the private pipe)", file=sys.stderr)
+            say("ignoring " + word.split("=", 1)[0] + " from " + source
+                + " (the debugging channel is the private pipe)")
             continue
         out.append(word)
     return out
@@ -298,6 +311,7 @@ def main():
             return
         outq[conn] += b"".join(line + b"\n" for line in lines)
         if len(outq[conn]) > MAX_QUEUED:
+            say("dropped a connection that stopped reading (over %d MiB waiting)" % (MAX_QUEUED >> 20))
             drop(conn)
         else:
             flush(conn)
@@ -345,6 +359,7 @@ def main():
                     # Answer the asker with an error rather than leave it waiting.
                     m = re.match(rb'\{"id":(\d+),', from_app)
                     route = routes.pop(int(m.group(1)), None) if m else None
+                    say("dropped an answer over %d MiB from the app" % (MAX_MESSAGE >> 20))
                     if route and route[0] in clients:
                         out.setdefault(route[0], []).append(dump({"id": route[1], "error": {
                             "code": -32000, "message": "cdp-bridge: answer over %d MiB dropped" % (MAX_MESSAGE >> 20)}}))
@@ -381,6 +396,7 @@ def main():
                     continue
                 *lines, rest = (clients[conn] + chunk).split(b"\n")
                 if len(rest) > MAX_MESSAGE:
+                    say("dropped a connection that sent a line over %d MiB" % (MAX_MESSAGE >> 20))
                     drop(conn)
                     continue
                 clients[conn] = rest
@@ -390,6 +406,7 @@ def main():
                         continue
                     why = refusal(msg)
                     if why:
+                        say("refused a command: " + why)
                         if "id" in msg:
                             err = {"id": msg["id"], "error": {"code": -32601, "message": "cdp-bridge: " + why}}
                             if isinstance(msg.get("sessionId"), str):
@@ -426,4 +443,9 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    syslog.openlog("cdp-bridge", syslog.LOG_PID, syslog.LOG_USER)
+    try:
+        sys.exit(main())
+    except Exception as e:
+        say("stopped by an error: %s: %s" % (type(e).__name__, str(e)[:300]), syslog.LOG_ERR)
+        raise

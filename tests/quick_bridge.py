@@ -192,6 +192,29 @@ class BridgeTest(Case):
         c.send({"id": 200, "method": "Browser.close"})
         self.assertEqual(c.recv()["id"], 200)
 
+    def journal_since(self, before):
+        return [line for line in self.syslog_lines()[before:] if "cdp-bridge[" in line]
+
+    def test_a_failed_start_is_logged_to_the_journal(self):
+        # The widget starts the bridge detached, with stderr on /dev/null.
+        before = len(self.syslog_lines())
+        os.chmod(self.rt, 0o755)
+        self.assertEqual(self.start_bridge().wait(timeout=5), 1)
+        self.assertTrue(wait_until(lambda: any("not a private directory" in line for line in self.journal_since(before)), 2),
+                        self.journal_since(before))
+
+    def test_dropped_flags_and_refusals_are_logged_to_the_journal(self):
+        before = len(self.syslog_lines())
+        self.write_flags("--inspect=127.0.0.1:9229\n")
+        self.bridge_up()
+        c = Conn(self.sock)
+        c.send({"id": 1, "method": "Network.getAllCookies"})
+        c.recv()
+        lines = lambda: self.journal_since(before)
+        self.assertTrue(wait_until(lambda: any("ignoring --inspect " in line for line in lines()), 2), lines())
+        self.assertTrue(wait_until(lambda: any("Network.getAllCookies" in line for line in lines()), 2), lines())
+        self.assertFalse(any("9229" in line for line in lines()), "only the switch name is logged")
+
 
 def race_once(case):
     """Two bridges started at the same moment (two widget copies waking the
