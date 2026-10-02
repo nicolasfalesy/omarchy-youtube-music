@@ -5,6 +5,7 @@ import Quickshell
 import Quickshell.Io
 import Quickshell.Widgets
 import Quickshell.Hyprland
+import Quickshell.Services.UPower
 import qs.Commons
 import qs.Ui
 import "Page.js" as Page
@@ -819,7 +820,11 @@ Panel {
   // Never under a minute: 0.01 rounded to 0 s and a negative value went
   // below 0, so the app quit at the first 15 s tick after every start.
   readonly property real idleMinutesSet: Math.max(1, Number(setting("idleMinutes", 5)) || 5)
-  readonly property int idleLimit: Math.round(idleMinutesSet * 60)
+  // On battery it quits after 2 minutes (or the setting, when that is
+  // shorter): the app costs about 1 s of CPU a minute and 450 wakeups a second
+  // even paused and hidden (deep review 2026-10-01; asked for the same day).
+  // UPower's onBattery is a live property, so no process runs per tick.
+  readonly property int idleLimit: Math.round((UPower.onBattery ? Math.min(2, idleMinutesSet) : idleMinutesSet) * 60)
   property int idleSeconds: 0
   // Whether the hidden "music" workspace (the app window) is on screen right
   // now, so the cover button can say "Hide app" instead of "Show app".

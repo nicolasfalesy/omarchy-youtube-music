@@ -26,4 +26,17 @@ TestCase {
     compare(limitFor(-3), 60)
     compare(limitFor("abc"), 300)
   }
+  // On battery the app quits after 2 minutes, or sooner if the setting says
+  // so; back on the charger the setting counts again, with no process run.
+  function test_battery_quits_sooner() {
+    UPower.onBattery = true
+    compare(limitFor(undefined), 120)
+    compare(limitFor(10), 120)
+    compare(limitFor(1), 60)
+    var w = createTemporaryObject(widgetComp, tc, { settings: { idleMinutes: 10 } })
+    compare(w.idleLimit, 120)
+    UPower.onBattery = false
+    compare(w.idleLimit, 600)
+    compare(Harness.procsMatching("upower").length + Harness.procsMatching("power_supply").length, 0)
+  }
 }
