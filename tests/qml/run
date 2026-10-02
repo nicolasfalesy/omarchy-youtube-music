@@ -41,8 +41,8 @@ mkdir -m 700 "$scratch/rt"
 # The runner runs as a copy named omarchy-crash-*: Omarchy's crash watcher
 # announces every core dump on screen except for that name, and a test that
 # crashes Qt should fail here, not pop a notice on the desktop.
-cp "$runner" "$scratch/omarchy-crash-qmltest"
-runner=$scratch/omarchy-crash-qmltest
+cp "$runner" "$scratch/omarchy-crash-ytmqmlrt"
+runner=$scratch/omarchy-crash-ytmqmlrt
 
 # A clean environment: no display, no session bus, a scratch HOME and XDG
 # folders, so Qt itself writes nothing outside the scratch folder.

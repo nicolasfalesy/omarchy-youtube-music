@@ -444,27 +444,32 @@ Panel {
     onFileChanged: reload()
   }
 
-  // An answer past restMaxChars is never parsed: the caller gets status 0
-  // and no data, like any failed call (deep review 2026-10-01: the whole
-  // answer was parsed on the UI thread, whatever its size; the app's real
-  // answers are a few KB). The transfer itself is not aborted: in Qt 6.11
-  // XMLHttpRequest.abort() while data is still arriving can crash the whole
-  // shell (QIODevice::readAll on the dropped reply, from a readyRead already
-  // queued; it took down the test runner twice in five runs).
+  // An answer past restMaxChars is cut off: the request is aborted while it
+  // still arrives, and the caller gets status 0 and no data, like any failed
+  // call (deep review 2026-10-01: the whole answer was read and parsed on
+  // the UI thread, whatever its size, and one that never ended never came
+  // back; the app's real answers are a few KB). The abort is never made
+  // inside onreadystatechange itself: there, Qt 6.11.2 drops the reply and
+  // then calls readAll() on it (QQmlXMLHttpRequest, replyDownloadProgress),
+  // which took down the test runner twice. Qt.callLater runs it just after.
   readonly property int restMaxChars: 4 * 1024 * 1024
   // Shared with every call still on its way; marked when the widget goes.
   readonly property var life: ({ alive: true })
   Component.onDestruction: life.alive = false
   function call(method, path, body, cb) {
     var x = new XMLHttpRequest()
-    var cap = root.restMaxChars, life = root.life
+    var cap = root.restMaxChars, life = root.life, over = false, answered = false
+    var stop = function() { if (over) return; over = true; Qt.callLater(function() { x.abort() }) }
     x.onreadystatechange = function() {
-      if (x.readyState !== XMLHttpRequest.DONE || !cb) return
       // The widget went away meanwhile (a shell reload, a monitor unplugged):
       // its callbacks would act on a destroyed object.
-      if (!life.alive) return
-      var t = x.responseText
-      if (t.length > cap) { cb(0, null); return }
+      if (!life.alive) { if (x.readyState !== XMLHttpRequest.DONE) stop(); return }
+      if (x.readyState === XMLHttpRequest.LOADING && x.responseText.length > cap) { stop(); return }
+      if (x.readyState !== XMLHttpRequest.DONE || answered) return
+      answered = true
+      if (!cb) return
+      var t = over ? "" : x.responseText
+      if (over || t.length > cap) { cb(0, null); return }
       var data = null
       try { data = t ? JSON.parse(t) : null } catch (e) {}
       cb(x.status, data)

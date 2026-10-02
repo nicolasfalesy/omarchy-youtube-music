@@ -3,10 +3,12 @@ import QtTest
 import YtmTest
 import "../.."
 
-// The REST calls to the app parsed the whole answer on the UI thread, with no
-// limit. An answer past 4 MiB is now never parsed, and the caller gets an
-// error, like for a call that failed. (A stand-in API from data/fakeapi.py,
-// in the tests' own network namespace.)
+// The REST calls to the app read and parsed the whole answer on the UI
+// thread, with no limit, and one that never ended never came back. Past
+// 4 MiB the call is now aborted (just after the handler, never inside it:
+// that crashes Qt 6.11) and the caller gets an error, like for a call that
+// failed. (A stand-in API from data/fakeapi.py, in the tests' own network
+// namespace.)
 TestCase {
   id: tc
   name: "RestCap"
@@ -48,8 +50,21 @@ TestCase {
     wait(700)
     compare(called, false)
   }
-  // A 64 MiB answer: read (the transfer cannot be stopped safely, see
-  // call() in Widget.qml) but never parsed, and reported as a failure.
+  // An answer that never ends: without the cap the call never came back.
+  // It must stop early, while the answer still arrives.
+  function test_endless_answer_is_cut_off() {
+    var w = createTemporaryObject(widgetComp, tc, { api: "http://127.0.0.1:26599/api/v1" })
+    var t0 = Date.now()
+    var r = get(w, "/endless")
+    compare(r.calls, 1)
+    compare(r.data, null)
+    verify(r.status !== 200, "an endless answer was taken as a good one")
+    verify(Date.now() - t0 < 4000)
+    wait(300)
+    var st = stats(w)
+    verify(!st.hugeDone && st.hugeSent < 32 * 1024 * 1024, "the answer was read on and on: " + st.hugeSent + " bytes")
+  }
+  // A 64 MiB answer of a fixed size: not taken either.
   function test_huge_answer_is_not_taken() {
     var w = createTemporaryObject(widgetComp, tc, { api: "http://127.0.0.1:26599/api/v1" })
     var r = get(w, "/huge")
