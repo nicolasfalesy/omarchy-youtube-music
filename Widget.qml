@@ -5,6 +5,7 @@ import Quickshell
 import Quickshell.Io
 import Quickshell.Widgets
 import Quickshell.Hyprland
+import Quickshell.Services.UPower
 import qs.Commons
 import qs.Ui
 import "Page.js" as Page
@@ -45,14 +46,16 @@ import "Page.js" as Page
 //
 // The app runs only while it is needed (the brief: run it in the background,
 // never keep it running when it is not needed, and keep it all seamless):
-//   - Its window lives on the hidden "music" workspace (rule in
-//     ~/.config/hypr/hyprland.lua); the cover art in the panel toggles it.
+//   - Its window lives on the hidden "music" workspace (a window rule the
+//     widget adds at runtime, see ensureWindowRule); the cover art in the
+//     panel toggles it.
 //   - Pressing play starts it in the background, and so does opening the panel
 //     (after 400 ms, so Tab passing through the panels does not count).
-//   - After idleMinutes (default 5) paused, with the panel closed on every
-//     monitor and the app window not on screen, it quits cleanly over the debug
-//     port (Browser.close; a plain kill made Chromium crash on purpose and pop a
-//     crash notice). The page gets one last look first, in case music plays.
+//   - After idleMinutes (default 5, at least 1; 2 on battery) paused, with
+//     the panel closed on every monitor and the app window not on screen, it
+//     quits cleanly with Browser.close through the bridge's private socket (a
+//     plain kill made Chromium crash on purpose and pop a crash notice). The
+//     page gets one last look first, in case music plays.
 //   - The last song, position and playlist are kept in
 //     ~/.local/state/omarchy/nic-youtube-music/last.json, so the bar keeps
 //     showing it while the app is closed and play resumes right where it was.
@@ -66,7 +69,8 @@ Panel {
   ipcTarget: "nic.youtube-music"
   manageIpc: false
 
-  readonly property string api: "http://127.0.0.1:26538/api/v1"
+  readonly property int apiPort: 26538
+  readonly property string api: "http://127.0.0.1:" + apiPort + "/api/v1"
   readonly property string appClass: "com.github.th-ch.youtube-music"
   // Its own folder, not ~/.local/state/omarchy itself: the shell watches three
   // folders there (toggles, indicators, current), and a FileView on a folder
@@ -199,6 +203,9 @@ Panel {
   // pauses at a song's end (the video's own pause event) just before the next
   // song loads, so "was playing a moment ago" still counts for autoplay.
   property double stoppedPlayingAt: 0
+  // Set by pauseOnly(): something outside paused this widget. World Radio
+  // does that every time a station starts.
+  property bool pausedFromOutside: false
   onIsPlayingChanged: {
     if (!isPlaying) { stoppedPlayingAt = Date.now(); return }
     // One player at a time (2026-09-24: starting either one stops the
@@ -207,6 +214,18 @@ Panel {
     // only while it is actually on (its stop also forgets the current
     // station). Without that plugin the status call fails and nothing runs. One copy does it, not one
     // per monitor. The radio's side pauses this widget through pauseOnly().
+    //
+    // Not on an autoplay step: the app pauses for a moment at each song's
+    // end, and the sh, omarchy-shell and jq this spawns ran for every song
+    // (deep review 2026-10-01). While this widget played, the radio could
+    // only have started by pausing it (pauseOnly), so a start within 5 s of
+    // a stop that no outside pause caused cannot find the radio on. Calling
+    // the radio widget directly is not possible: Omarchy gives a plugin's bar
+    // API only its own widgets (bar.moduleWidgets is scoped to the plugin's
+    // own id, Bar.qml pluginBarApiFor).
+    var step = ageMs(stoppedPlayingAt) < 5000 && !pausedFromOutside
+    pausedFromOutside = false
+    if (step) return
     if (isPrimary())
       Quickshell.execDetached(["sh", "-c", "omarchy-shell nic.world-radio status | jq -e '.playing or .buffering' >/dev/null && omarchy-shell -q nic.world-radio stop"])
   }
@@ -248,6 +267,9 @@ Panel {
   property var pageHeader: null
   property bool loading: false
   property string listError: ""
+  // listError is a failure (the page did not answer, a search failed), not
+  // an empty page or a "sign in" note: the list area then offers Try again.
+  property bool listFailed: false
   property bool signedIn: true
   // The whole queue and the next songs, both from one page snapshot
   // (loadQueue), so the Queue tab and Up next always agree.
@@ -413,7 +435,7 @@ Panel {
   // without it. Under auth that probe is refused (the app accepts the socket,
   // then closes it with 1008), so a token that arrives while the app is not up
   // probes again at once instead of at the next 20 s tick.
-  onApiTokenChanged: { if (!appUp) probe(); wakeIfSetUp() }
+  onApiTokenChanged: { tokenRejected = false; tokenRefusals = 0; if (!appUp) probe(); wakeIfSetUp() }
   FileView {
     id: tokenFile
     path: root.stateDir + "/token"
@@ -424,17 +446,40 @@ Panel {
     onFileChanged: reload()
   }
 
-  function call(method, path, body, cb) {
+  // An answer past restMaxChars is cut off: the request is aborted while it
+  // still arrives, and the caller gets status 0 and no data, like any failed
+  // call (deep review 2026-10-01: the whole answer was read and parsed on
+  // the UI thread, whatever its size, and one that never ended never came
+  // back; the app's real answers are a few KB). The abort is never made
+  // inside onreadystatechange itself: there, Qt 6.11.2 drops the reply and
+  // then calls readAll() on it (QQmlXMLHttpRequest, replyDownloadProgress),
+  // which took down the test runner twice. Qt.callLater runs it just after.
+  readonly property int restMaxChars: 4 * 1024 * 1024
+  // Shared with every call still on its way; marked when the widget goes.
+  readonly property var life: ({ alive: true })
+  Component.onDestruction: life.alive = false
+  // noToken: send no Authorization header even when one is trusted.
+  function call(method, path, body, cb, noToken) {
     var x = new XMLHttpRequest()
+    var cap = root.restMaxChars, life = root.life, over = false, answered = false
+    var stop = function() { if (over) return; over = true; Qt.callLater(function() { x.abort() }) }
     x.onreadystatechange = function() {
-      if (x.readyState !== XMLHttpRequest.DONE) return
+      // The widget went away meanwhile (a shell reload, a monitor unplugged):
+      // its callbacks would act on a destroyed object.
+      if (!life.alive) { if (x.readyState !== XMLHttpRequest.DONE) stop(); return }
+      if (x.readyState === XMLHttpRequest.LOADING && x.responseText.length > cap) { stop(); return }
+      if (x.readyState !== XMLHttpRequest.DONE || answered) return
+      answered = true
       if (!cb) return
+      var t = over ? "" : x.responseText
+      if (over || t.length > cap) { cb(0, null); return }
       var data = null
-      try { data = x.responseText ? JSON.parse(x.responseText) : null } catch (e) {}
+      try { data = t ? JSON.parse(t) : null } catch (e) {}
       cb(x.status, data)
     }
     x.open(method, root.api + path)
-    if (root.apiToken) x.setRequestHeader("Authorization", "Bearer " + root.apiToken)
+    // Only to a port known to be this user's app (see portTrusted).
+    if (root.apiToken && root.portTrusted && !noToken) x.setRequestHeader("Authorization", "Bearer " + root.apiToken)
     if (body !== undefined && body !== null) {
       x.setRequestHeader("Content-Type", "application/json")
       x.send(JSON.stringify(body))
@@ -445,6 +490,10 @@ Panel {
   function cmd(path, body) { call("POST", path, body === undefined ? null : body, null) }
 
   function hasLast() { return !!(lastSong && lastSong.videoId) }
+  // Milliseconds since t. A time in the future means the clock was stepped
+  // back (NTP after a sleep, a manual change), and the age is then unknown:
+  // it counts as long ago (Infinity), never as "just now".
+  function ageMs(t) { var a = Date.now() - t; return a < 0 ? Infinity : a }
   // Nothing of the user's is loaded in the player: the app is closed, or it holds
   // only YouTube Music's restored cue while a song is remembered, or it holds
   // nothing at all. Play, next and previous then start or resume instead: the
@@ -537,18 +586,19 @@ Panel {
       })
     }
   }
-  // With nothing of the user's loaded, next and previous resume the remembered
-  // song instead (a middle click on a closed app should not skip a song never
-  // heard).
   // Pause if something plays; never start, never wake the app. /pause is the
   // app's pauseVideo(), which does nothing on a paused or cued player.
   function pauseOnly() {
     if (!appUp) return
+    pausedFromOutside = true
     stateEpoch += 1
     pausedAt = Date.now()
     isPlaying = false
     cmd("/pause")
   }
+  // With nothing of the user's loaded, next and previous resume the remembered
+  // song instead (a middle click on a closed app should not skip a song never
+  // heard).
   function next() { if (nothingReal()) { wake("play"); return } expect(""); cmd("/next") }
   function previous() { if (nothingReal()) { wake("play"); return } expect(""); cmd("/previous") }
 
@@ -563,9 +613,9 @@ Panel {
     // Not installed or not set up: nothing to start yet. The panel says what
     // to do; a play from the bar says so in a toast. Setup itself wakes the
     // app through here to mint its token, so it is let through.
-    if (!setupRunning && !appUp && (!appInstalled || needsSetup)) {
-      if (action === "play") toastFor(appInstalled ? "YouTube Music isn't set up yet. Open the panel to set it up."
-        : "YouTube Music isn't installed yet. Open the panel to install it.", 5000)
+    if (!setupRunning && !appUp && (!appInstalled || needsSetup || tokenRejected)) {
+      if (action === "play") toastFor(!appInstalled ? "YouTube Music isn't installed yet. Open the panel to install it."
+        : tokenRejected ? tokenRejectedText : "YouTube Music isn't set up yet. Open the panel to set it up.", 5000)
       return
     }
     if (action === "play") pendingAction = "play"
@@ -582,12 +632,41 @@ Panel {
     id: launchTimer
     interval: 600
     // Through the bridge, so the app runs with the private pipe and no port.
-    onTriggered: if (!root.appUp) Quickshell.execDetached(["setsid", "-f", root.bridgePath])
+    onTriggered: if (!root.appUp && !launcher.running) { root.launchedApp = true; launcher.running = true }
+  }
+  // The bridge runs in a session of its own (setsid), so a shell restart never
+  // takes the app down, as with the `setsid -f` this replaces. But that gave
+  // no word when the bridge stopped at once (no python3, a broken runtime
+  // folder, a second bridge racing it): the panel said "Waking up" for the
+  // whole 40 s start timeout (deep review 2026-10-01). So a small sh watches
+  // it for its first 5 s and passes on its exit status if it ends by then;
+  // a bridge still running after that is left alone and the sh exits 0.
+  Process {
+    id: launcher
+    command: ["sh", "-c", "setsid \"$0\" </dev/null >/dev/null 2>&1 & p=$!; "
+      + "for i in 1 2 3 4 5 6 7 8 9 10; do sleep 0.5; kill -0 \"$p\" 2>/dev/null || { wait \"$p\"; exit $?; }; done; exit 0",
+      root.bridgePath]
+    onExited: function(exitCode) {
+      if (exitCode !== 0 && !root.appUp && root.starting) root.startFailedNow()
+    }
+  }
+  function startFailedNow() {
+    startTimeout.stop()
+    starting = false
+    startFailed = true
+    pendingAction = ""
+    // The panel says so itself; with it closed, a notification does.
+    if (!setupRunning && !anyCopyOpen()) toastFor("YouTube Music didn't start. Try again, or start the YouTube Music app from the launcher.", 6000)
+  }
+  function anyCopyOpen() {
+    var ps = peers()
+    for (var i = 0; i < ps.length; i++) if (ps[i] && ps[i].opened) return true
+    return opened
   }
   Timer {
     id: startTimeout
     interval: 40000
-    onTriggered: if (!root.appUp) { root.starting = false; root.startFailed = true; root.pendingAction = "" }
+    onTriggered: if (!root.appUp) root.startFailedNow()
   }
 
   // The API socket opens before the page has finished loading, so wait for
@@ -678,7 +757,7 @@ Panel {
         ep.startTimeSeconds = at
         // Fallback only: if the first push lands more than 5 s off within 20 s,
         // seek once (see POSITION_CHANGED).
-        root.resumeTarget = { videoId: ls.videoId, at: at, until: Date.now() + 20000 }
+        root.resumeTarget = { videoId: ls.videoId, at: at, since: Date.now() }
       } else root.resumeTarget = null
       var navigate = function() {
         root.expect(ls.videoId)
@@ -754,15 +833,37 @@ Panel {
   // has no title.
   function forgetLast() { shareLast(null) }
   function takeLast(t) {
-    try {
-      var v = JSON.parse(t)
-      if (v && v.title) {
-        root.lastSong = v
-        if (!root.appUp) { root.position = Number(v.elapsedSeconds || 0); root.reportedPosition = root.position }
-        return true
-      }
-    } catch (e) {}
-    return false
+    var v = cleanLast(t)
+    if (!v) return false
+    root.lastSong = v
+    if (!root.appUp) { root.position = v.elapsedSeconds; root.reportedPosition = root.position }
+    return true
+  }
+  // last.json is read back on every shell start. Only this widget writes it,
+  // but nothing stops another program or a broken write from putting anything
+  // there, and what it holds is drawn in the bar, sent to the page and loaded
+  // as an image. So only the shape saveLast() writes comes back out: a whole
+  // file of at most 64 Ki characters (a 50 MB title once took 6.8 s and 2.2 GB
+  // to lay out a single Text, deep review 2026-10-01), plain strings cut to
+  // 1000 characters, YouTube-shaped ids, seconds within a day, and cover art
+  // only from Google's image hosts. Anything else is "nothing remembered".
+  readonly property int lastMaxChars: 64 * 1024
+  readonly property var ytId: /^[A-Za-z0-9_-]{1,64}$/
+  function cleanLast(t) {
+    if (typeof t !== "string" || t.length > lastMaxChars) return null
+    var v
+    try { v = JSON.parse(t) } catch (e) { return null }
+    if (!v || typeof v !== "object" || Array.isArray(v)) return null
+    if (typeof v.title !== "string" || v.title.trim() === "") return null
+    if (typeof v.videoId !== "string" || !ytId.test(v.videoId)) return null
+    var str = function(x) { return typeof x === "string" ? x.slice(0, 1000) : "" }
+    var secs = function(x) { var n = Number(x); return isFinite(n) ? Math.min(86400, Math.max(0, n)) : 0 }
+    return {
+      title: v.title.slice(0, 1000), artist: str(v.artist), album: str(v.album),
+      imageSrc: artUrlOk(v.imageSrc) ? v.imageSrc : "",
+      videoId: v.videoId, playlistId: typeof v.playlistId === "string" && ytId.test(v.playlistId) ? v.playlistId : "",
+      songDuration: secs(v.songDuration), elapsedSeconds: Math.floor(secs(v.elapsedSeconds))
+    }
   }
   FileView {
     id: lastFile
@@ -774,14 +875,23 @@ Panel {
     // Before 2026-09-24 the file sat at ~/.local/state/omarchy/nic-youtube-music-last.json
     // (see stateDir for why it moved). Read the old one once when the new one
     // is missing, and carry it over, so the remembered song survives the move.
-    onLoadFailed: oldLastFile.path = Quickshell.env("HOME") + "/.local/state/omarchy/nic-youtube-music-last.json"
+    onLoadFailed: oldLastFile.path = root.legacyLastPath
+    // The carried-over copy is written: the old file goes, so it is not read
+    // (or left behind) again. Only after a good write.
+    onSaved: if (root.migratingLast) { root.migratingLast = false; Quickshell.execDetached(["rm", "-f", "--", root.legacyLastPath]) }
+    onSaveFailed: root.migratingLast = false
   }
+  readonly property string legacyLastPath: Quickshell.env("HOME") + "/.local/state/omarchy/nic-youtube-music-last.json"
+  property bool migratingLast: false
   FileView {
     id: oldLastFile
     path: ""
     watchChanges: false
     printErrors: false
-    onLoaded: if (root.takeLast(text()) && root.isPrimary()) lastFile.setText(text())
+    onLoaded: if (root.takeLast(text()) && root.isPrimary()) {
+      root.migratingLast = true
+      lastFile.setText(JSON.stringify(root.lastSong, null, 2) + "\n")
+    }
   }
   Timer {
     id: saveTimer
@@ -794,7 +904,14 @@ Panel {
 
   // Quit when idle. Counts only while paused, the panel is closed on every
   // monitor, and the app is not on screen.
-  readonly property int idleLimit: (Number(setting("idleMinutes", 5)) || 5) * 60
+  // Never under a minute: 0.01 rounded to 0 s and a negative value went
+  // below 0, so the app quit at the first 15 s tick after every start.
+  readonly property real idleMinutesSet: Math.max(1, Number(setting("idleMinutes", 5)) || 5)
+  // On battery it quits after 2 minutes (or the setting, when that is
+  // shorter): the app costs about 1 s of CPU a minute and 450 wakeups a second
+  // even paused and hidden (deep review 2026-10-01; asked for the same day).
+  // UPower's onBattery is a live property, so no process runs per tick.
+  readonly property int idleLimit: Math.round((UPower.onBattery ? Math.min(2, idleMinutesSet) : idleMinutesSet) * 60)
   property int idleSeconds: 0
   // Whether the hidden "music" workspace (the app window) is on screen right
   // now, so the cover button can say "Hide app" instead of "Show app".
@@ -914,6 +1031,17 @@ Panel {
     root.reportedPosition = ls.elapsedSeconds
     shareLast(ls)
   }
+  // Left and Right in the panel: back or forward by sec within the song (the
+  // remembered one's resume point while nothing of the user's is loaded, as
+  // the seek bar does). Forward stops a second short of the end, so a press
+  // near the end does not roll into the next song. Timed lyrics jump at once.
+  function seekBy(sec) {
+    if (!hasSong || duration <= 0) return
+    var to = Math.max(0, Math.min(duration - 1, position + sec))
+    if (sec > 0 && to < position) return
+    seekTo(to)
+    if (lyricsLive) lyricsAnchor = { t: to, at: Date.now(), playing: lyricsAnchor.playing }
+  }
   // The app reports volume on another scale than it is set on: /volume 57
   // comes back as 26 in VOLUME_CHANGED and GET /volume (its player applies a
   // loudness curve). Taking that echo as the slider value made the knob drop
@@ -938,9 +1066,13 @@ Panel {
   }
   property int volSent: -1
   property double volSentAt: 0
+  // An echo equal to the value sent is taken as it is: upstream pear-desktop
+  // PR #4672 makes the app report the volume it was given, and that echo
+  // went through the curve a second time (57 came back as 81).
   function takeAppVolume(r) {
+    if (volSent >= 0 && Math.round(r) === volSent) { volume = volSent; return }
     if (volSent >= 0 && Math.abs(volCurveMap(volSent, 0, 1) - r) <= 1.5) { volume = volSent; return }
-    if (Date.now() - volSentAt < 1000) return
+    if (ageMs(volSentAt) < 1000) return
     volSent = -1
     volume = Math.round(volCurveMap(r, 1, 0))
   }
@@ -957,8 +1089,9 @@ Panel {
   function toggleMute() { cmd("/toggle-mute") }
   function toggleShuffle() { cmd("/shuffle"); root.shuffle = !root.shuffle }
   function cycleRepeat() { cmd("/switch-repeat", { iteration: 1 }) }
-  function like() { cmd("/like"); fetchLike() }
-  function dislike() { cmd("/dislike"); fetchLike() }
+  // Liked songs changes with these: its kept copy goes (see browseCache).
+  function like() { cmd("/like"); fetchLike(); dropTop("VLLM") }
+  function dislike() { cmd("/dislike"); fetchLike(); dropTop("VLLM") }
   function fetchLike() {
     likeTimer.restart()
   }
@@ -1045,7 +1178,7 @@ Panel {
   }
 
   // ------------------------------------------------------------ live state socket
-  readonly property string wsUrl: "ws://127.0.0.1:26538/api/v1/ws"
+  readonly property string wsUrl: "ws://127.0.0.1:" + apiPort + "/api/v1/ws"
   WebSocket {
     id: live
     // url is set by probe(), not bound. The token file loads a moment after
@@ -1055,6 +1188,8 @@ Panel {
     active: false
     onStatusChanged: {
       if (live.status === WebSocket.Open) {
+        // Something listens on the port (see portTrusted).
+        if (!root.appUp) root.liveAnswered = true
         // Not "up" yet. With the app's auth on and a missing or stale token,
         // the app accepts the socket and then closes it at once (1008,
         // api-server onOpen). Marking the app up here made every such
@@ -1067,6 +1202,8 @@ Panel {
       } else if (live.status === WebSocket.Closed || live.status === WebSocket.Error) {
         var wasUp = root.appUp
         if (wasUp) {
+          // Whoever listens next is checked again.
+          root.portTrusted = false
           root.saveLast()
           root.appUp = false
           root.isPlaying = false
@@ -1082,6 +1219,13 @@ Panel {
           root.reportedPosition = root.position
         }
         active = false
+        // A listener closed a probe that went without the token (the app's
+        // auth refusing it, 1008): find out whose it is before the token goes.
+        if (!wasUp && root.liveAnswered && !root.liveWithToken && root.apiToken !== "" && !root.portTrusted)
+          root.checkPortOwner()
+        // The app took a socket that carried the token and closed it before
+        // saying anything: it turned the token down.
+        else if (!wasUp && root.liveAnswered && root.liveWithToken) root.tokenRefused()
         // No retry.restart() here. This handler runs outside the timer's own
         // tick, and restart() re-arms triggeredOnStart, so every refused
         // connect queued the next one at once: about 44,000 connects a second
@@ -1130,7 +1274,7 @@ Panel {
         // showed the cue as playing, the "Meet Me Halfway" bug again
         // (offline test, 2026-09-24). A VIDEO_CHANGED for another
         // video leaves the wait for its own song; expectTimer ends it.
-        var wasReal = root.songReal && (root.isPlaying || now - root.stoppedPlayingAt < 5000)
+        var wasReal = root.songReal && (root.isPlaying || root.ageMs(root.stoppedPlayingAt) < 5000)
         var vid = m.song ? String(m.song.videoId || "") : ""
         var mine = root.expectSong && (root.expectVideo === "" || vid === root.expectVideo)
         root.songReal = wasReal || mine
@@ -1176,8 +1320,8 @@ Panel {
         // Two pushes in a row that move forward by up to 2.5 s within 2.5 s
         // prove the song plays. This is the only sign of a play that started
         // at 0:00 (the app never reports one), which otherwise stayed "paused".
-        var moving = p > root.posPushPos && p - root.posPushPos <= 2.5 && now - root.posPushAt < 2500
-          && now - root.pausedAt > 3000
+        var moving = p > root.posPushPos && p - root.posPushPos <= 2.5 && root.ageMs(root.posPushAt) < 2500
+          && root.ageMs(root.pausedAt) > 3000
         root.posPushPos = p
         root.posPushAt = now
         root.lastPush = now
@@ -1197,12 +1341,12 @@ Panel {
         var target = root.resumeTarget
         if (target && root.song && root.song.videoId === target.videoId) {
           root.resumeTarget = null
-          if (now < target.until && Math.abs(p - target.at) > 5) {
+          if (root.ageMs(target.since) < 20000 && Math.abs(p - target.at) > 5) {
             root.position = target.at
             root.reportedPosition = target.at
             root.cmd("/seek-to", { seconds: target.at })
           }
-        } else if (target && now >= target.until) root.resumeTarget = null
+        } else if (target && root.ageMs(target.since) >= 20000) root.resumeTarget = null
       } else if (m.type === "VOLUME_CHANGED") {
         root.takeAppVolume(Number(m.volume))
         root.muted = !!m.muted
@@ -1234,22 +1378,32 @@ Panel {
   // on the local network: the API allows every origin) can drive the signed-in
   // account, so the panel says how to lock it.
   property bool apiOpen: false
+  // Through call(), without the token: its size cap and its check that the
+  // widget is still there apply (an answer after a shell reload threw a
+  // TypeError on the destroyed widget).
   function checkApiLock() {
-    var x = new XMLHttpRequest()
-    x.onreadystatechange = function() {
-      if (x.readyState !== XMLHttpRequest.DONE) return
-      root.apiOpen = x.status === 200
+    call("GET", "/volume", null, function(status) {
+      root.apiOpen = status === 200
       if (root.apiOpen && root.opened) root.warnApiOpen()
-    }
-    x.open("GET", root.api + "/volume")
-    x.send()
+    }, true)
   }
+  // Points at the panel's own Set up (a button in the toast), not at a
+  // terminal step: the panel has done setup itself since 2.4.0.
   function warnApiOpen() {
-    toastFor("The app's API answers any program. Run tools/setup in the plugin folder to lock it.", 8000)
+    toastFor("The app's API answers any program. Set up locks it to this widget (the app restarts once).", 10000,
+      { label: "Set up", run: function() { root.runSetup() } })
   }
 
+  // The app was up at some point in this session. "Start it again" read
+  // wrong right after a first install, when nothing had played yet.
+  property bool appEverUp: false
+  readonly property string closedHint: appEverUp ? "Start it again to keep listening." : "Start it to listen. It runs in the background."
   function markUp() {
     appUp = true
+    appEverUp = true
+    tokenRefusals = 0
+    tokenRejected = false
+    launchedApp = false
     checkApiLock()
     starting = false
     startFailed = false
@@ -1264,12 +1418,86 @@ Panel {
   }
   function probe() {
     // A token file written while the shell runs (nic-ytm-lock) is not always
-    // seen by the watch, so look again on each probe while there is none.
-    if (!apiToken) tokenFile.reload()
+    // seen by the watch, so look again on each probe while there is none
+    // (or while the app turns the one we have down).
+    if (!apiToken || tokenRejected) tokenFile.reload()
+    // A connect that never finishes (something took the TCP connection and
+    // never answered the WebSocket handshake) blocked every later probe for
+    // good. Past connectTimeoutMs it is dropped and this probe goes ahead.
+    if (live.status === WebSocket.Connecting && ageMs(liveSince) > connectTimeoutMs) live.active = false
     if (live.status === WebSocket.Open || live.status === WebSocket.Connecting) return
+    liveSince = Date.now()
+    var tok = apiToken !== "" && portTrusted && !tokenRejected
     live.active = false
-    live.url = root.wsUrl + (root.apiToken ? "?token=" + encodeURIComponent(root.apiToken) : "")
+    liveWithToken = tok
+    liveAnswered = false
+    live.url = root.wsUrl + (tok ? "?token=" + encodeURIComponent(root.apiToken) : "")
     live.active = true
+  }
+  // The token goes only to a port that belongs to this user. While the app
+  // is closed the port is free, and any program of any user could listen
+  // there and collect the token from the widget's probes (every 20 s, deep
+  // review 2026-10-01; on a one-user laptop only a system service's account
+  // could). So probes go without the token until something answers on the
+  // port: the app with its auth on accepts that socket and closes it (1008).
+  // Then `ss -e` names the uid of every socket listening there, and only when
+  // all of them are this user's (`id -u`) does the next probe carry the
+  // token. ss leaves out uid 0, so root's listener never passes. One check
+  // per app start, none while the app is closed; trust ends when the app
+  // goes. An app whose API is still open (auth NONE) comes up through the
+  // token-less probe and never needs the token. The REST calls send it only
+  // while trusted too.
+  property bool portTrusted: false
+  property double liveSince: 0
+  property int connectTimeoutMs: 10000
+  property bool liveWithToken: false
+  property bool liveAnswered: false
+  function checkPortOwner() { if (!portCheck.running) portCheck.running = true }
+
+  // The app turns the token down (its settings were reset, or another setup
+  // minted a new one): it accepts each socket with the token and closes it
+  // at once (1008). The panel waited out the 40 s start timeout and then said
+  // "didn't start", and the app it had started kept running unused (deep
+  // review 2026-10-01). Two refusals in a row (one can be the app quitting
+  // just then) now stop the start, quit the app if this widget started it,
+  // and show the Set up screen with what to do. Probes then go without the
+  // token until the token file changes.
+  property bool tokenRejected: false
+  property int tokenRefusals: 0
+  // This wake launched the bridge, so the app is this widget's to quit.
+  property bool launchedApp: false
+  function tokenRefused() {
+    if (setupRunning) return
+    tokenRefusals += 1
+    if (tokenRefusals < 2 || tokenRejected) return
+    tokenRejected = true
+    if (starting) {
+      startTimeout.stop()
+      starting = false
+      pendingAction = ""
+    }
+    if (launchedApp) { launchedApp = false; quitApp() }
+    // The panel shows it on its Set up screen; with no panel open, a notification.
+    if (!anyCopyOpen()) toastFor(tokenRejectedText, 8000)
+  }
+  readonly property string tokenRejectedText: "YouTube Music turned down this widget's key. Open the panel and run Set up again."
+  function portOwnedByMe(t) {
+    var ls = String(t || "").split("\n").map(function(l) { return l.trim() }).filter(function(l) { return l !== "" })
+    if (ls.length < 2 || !/^[0-9]+$/.test(ls[0])) return false
+    for (var i = 1; i < ls.length; i++) {
+      var m = /(?:^|\s)uid:([0-9]+)(?:\s|$)/.exec(ls[i])
+      if (!m || m[1] !== ls[0]) return false
+    }
+    return true
+  }
+  Process {
+    id: portCheck
+    command: ["sh", "-c", "id -u; exec ss -ltnHe 'sport = :" + root.apiPort + "'"]
+    stdout: StdioCollector { id: portOut; waitForEnd: true }
+    onExited: function(exitCode) {
+      root.portTrusted = exitCode === 0 && root.portOwnedByMe(portOut.text)
+      if (root.portTrusted && !root.appUp) root.probe()
+    }
   }
   // The app was started by hand: probe every second for 20 s, since its API
   // comes up a moment after its window.
@@ -1298,7 +1526,7 @@ Panel {
     interval: 250
     repeat: true
     running: root.isPlaying && root.appUp && root.songReal && root.opened
-    onTriggered: if (Date.now() - root.lastPush < 2000 && (root.duration <= 0 || root.position < root.duration)) root.position += 0.25
+    onTriggered: if (root.ageMs(root.lastPush) < 2000 && (root.duration <= 0 || root.position < root.duration)) root.position += 0.25
   }
 
   // Ask the page what the player really does, and believe it. See the header
@@ -1357,17 +1585,20 @@ Panel {
     interval: 3000
     repeat: true
     running: root.appUp && root.isPlaying
-    onTriggered: if (Date.now() - root.lastPush >= 2500) root.checkPlayState()
+    onTriggered: if (root.ageMs(root.lastPush) >= 2500) root.checkPlayState()
   }
 
   // ------------------------------------------------------------ page bridge (CDP)
   property int cdpId: 0
   property var cdpPending: ({})
   // A call that never answers (a fetch stuck on a dead connection) left
-  // "Loading…" up for good. Each call gets 20 s, then fails like a closed socket.
+  // "Loading…" up for good. Each call gets 20 s, then fails like a closed
+  // socket. The map holds when each call was sent (not a deadline), so a
+  // clock stepped back makes a call late (ageMs), never one that waits for
+  // good.
   property var cdpDeadline: ({})
+  readonly property int cdpTimeoutMs: 20000
   property var cdpQueue: []                // [{id, msg, offlineOk}] waiting for the socket
-  property bool cdpLooking: false
   // pear swaps in its own offline page (assets/error.html) whenever a page
   // load fails (index.js did-fail-load, which does not even check for the main
   // frame). Its Retry reloads only the FOCUSED window, and ours sits hidden on
@@ -1485,8 +1716,14 @@ Panel {
     } else if (m.result && m.result.result) cb(m.result.result.value, "")
     else if (m.result && !m.error) cb(m.result, "")          // Page.navigate and Target.* answer plain objects
     else {
-      console.warn("nic.youtube-music page error:", JSON.stringify(m.error || m).slice(0, 2000))
-      cb(null, "The YouTube Music page did not answer. Try again.", m.error ? String(m.error.message || "") : "")
+      var raw = m.error ? String(m.error.message || "") : ""
+      // A page call that will be tried again (see pageAnswer) is logged only
+      // if the retry fails too: the first "Cannot find default execution
+      // context" is an expected step of every app start (it was most of the
+      // plugin's journal lines, deep review 2026-10-01).
+      if (!(cb.retriesContext && root.contextGone(raw)))
+        console.warn("nic.youtube-music page error:", JSON.stringify(m.error || m).slice(0, 2000))
+      cb(null, "The YouTube Music page did not answer. Try again.", raw)
     }
   }
   Timer {
@@ -1497,7 +1734,7 @@ Panel {
     onTriggered: {
       var now = Date.now()
       var late = []
-      for (var k in root.cdpDeadline) if (root.cdpDeadline[k] < now) late.push(Number(k))
+      for (var k in root.cdpDeadline) if (root.ageMs(root.cdpDeadline[k]) > root.cdpTimeoutMs) late.push(Number(k))
       if (!late.length) return
       root.cdpQueue = root.cdpQueue.filter(function(q) { return late.indexOf(q.id) < 0 })
       for (var i = 0; i < late.length; i++) root.cdpFailOne(late[i], "YouTube Music did not answer. Try again.")
@@ -1508,7 +1745,7 @@ Panel {
     root.cdpId += 1
     var id = root.cdpId
     root.cdpPending[id] = cb || function() {}
-    root.cdpDeadline[id] = Date.now() + 20000
+    root.cdpDeadline[id] = Date.now()
     root.cdpWrite({ id: id, method: method, params: params })
   }
   // Find the page and attach to it, then send what queued up meanwhile.
@@ -1520,7 +1757,12 @@ Panel {
       var target = null, offline = null
       for (var i = 0; i < list.length; i++) {
         if (list[i].type !== "page") continue
-        if (String(list[i].url).indexOf("music.youtube.com") !== -1) target = list[i]
+        // Exactly https://music.youtube.com, nothing else: a substring check
+        // also took Google's sign-in and consent pages, whose continue=
+        // names music.youtube.com, and look-alike hosts (deep review
+        // 2026-10-01). Anything after the host must start a path, query or
+        // fragment, so "@other.host" or ".other.host" never passes.
+        if (/^https:\/\/music\.youtube\.com(?:[\/?#]|$)/.test(String(list[i].url))) target = list[i]
         else if (/\/assets\/error\.html$/.test(String(list[i].url))) offline = list[i]
       }
       if (target) { root.cdpAttach(target.targetId, "music"); return }
@@ -1560,7 +1802,7 @@ Panel {
     root.cdpId += 1
     var id = root.cdpId
     root.cdpPending[id] = cb || function() {}
-    root.cdpDeadline[id] = Date.now() + 20000
+    root.cdpDeadline[id] = Date.now()
     var cmd = { id: id, method: method, params: params }
     if (cdpSock.connected && root.cdpSession !== "" && (root.cdpSessionKind === "music" || offlineOk)) {
       cmd.sessionId = root.cdpSession
@@ -1584,14 +1826,15 @@ Panel {
   // Every page answer passes here first. Page.js answers offlineText (the
   // same sentence, see safe() there) only on pear's offline page, so any list
   // load that meets it also starts the way back (noteOffline).
+  function contextGone(raw) { return /Cannot find default execution context/i.test(raw || "") }
   function pageAnswer(cb, expr, retried) {
-    return function(v, err, raw) {
+    var answer = function(v, err, raw) {
       // Right after the app starts, the page swaps its JS context once more
       // after it looks ready, and a call that lands then fails with "Cannot
       // find default execution context" without having run at all (seen
       // 2026-09-24 18:07 and 18:51). A resume or play hit by it failed with a
       // toast. Such a call is safe to repeat, so it goes again once, 0.5 s later.
-      if (!retried && raw && /Cannot find default execution context/i.test(raw)) {
+      if (!retried && root.contextGone(raw)) {
         root.pageRetries = root.pageRetries.concat([{ expr: expr, cb: cb }])
         pageRetryLater.restart()
         return
@@ -1599,6 +1842,8 @@ Panel {
       if (v && v.error === root.offlineText) root.noteOffline()
       if (cb) cb(v, err)
     }
+    answer.retriesContext = !retried
+    return answer
   }
   property var pageRetries: []
   Timer {
@@ -1629,7 +1874,7 @@ Panel {
   // while someone is looking (panel open) or a play is waiting. The error page
   // is a file:// page, so CDP's Page.navigate works on it whatever has focus.
   function retryAppPage() {
-    if (!appUp || !(opened || pendingAction !== "") || Date.now() - lastPageRetry < 10000) return
+    if (!appUp || !(opened || pendingAction !== "") || ageMs(lastPageRetry) < 10000) return
     lastPageRetry = Date.now()
     cdpSend("Page.navigate", { url: "https://music.youtube.com/" }, function(v, err) {
       if (err) return
@@ -1647,12 +1892,6 @@ Panel {
     onTriggered: root.retryAppPage()
   }
 
-  // Reads searchText itself, not the searching binding: clearing the search
-  // calls this from onSearchTextChanged, where Qt 6.11 still hands back the
-  // old value of a binding on searchText (the handler runs before the binding
-  // updates). It saw "still searching", ran an empty search that did nothing,
-  // and Home never came back (offline test through the keyboard, 2026-09-24;
-  // the same trap as in World Radio's memory note).
   // ------------------------------------------------------------ lyrics
   // Asked for 2026-09-24: lyrics "as good as Apple Music does", and then for
   // them to follow each word. Word timing comes from KuGou (see kugouLookup),
@@ -1667,7 +1906,19 @@ Panel {
   property string lyricsSource: ""
   property string lyricsState: ""      // "", loading, ready, none, nosong
   property string lyricsFor: ""
+  // Per song for the session, at most lyricsCacheMax songs: the oldest goes
+  // first (lyricsOrder). It had no cap and grew for the shell's whole life.
   property var lyricsCache: ({})
+  property var lyricsOrder: []
+  readonly property int lyricsCacheMax: 50
+  function keepLyrics(vid, res) {
+    var c = lyricsCache, order = lyricsOrder.filter(function(k) { return k !== vid })
+    c[vid] = res
+    order.push(vid)
+    while (order.length > lyricsCacheMax) delete c[order.shift()]
+    lyricsCache = c
+    lyricsOrder = order
+  }
   property int lyricsSerial: 0
   property int lyricIndex: -1
   property var lyricsFetches: []
@@ -1686,11 +1937,14 @@ Panel {
     var mine = lyricsSerial
     lyricsState = "loading"
     lyricLines = []
+    // A lookup that failed (no network, a timeout, a server error) marks
+    // ctx: what came of it is shown but not kept, so the song is asked again
+    // next time. "No lyrics" from a failed fetch was kept for the shell's
+    // whole life (deep review 2026-10-01). A real "not found" is kept.
+    var ctx = { failed: false }
     var done = function(res) {
       if (mine !== root.lyricsSerial) return
-      var c = root.lyricsCache
-      c[vid] = res
-      root.lyricsCache = c
+      if (!ctx.failed) root.keepLyrics(vid, res)
       root.applyLyrics(res)
     }
     // KuGou and LRCLIB are asked at the same time (KuGou's two steps take
@@ -1705,13 +1959,13 @@ Panel {
       if (words) { done({ synced: true, words: true, lines: words, source: "KuGou" }); return }
       if (lr && lr.synced) { done(lr); return }
       if (!root.appUp) { done(lr || { none: true }); return }
-      root.page("window.__nicYtm.lyrics(" + JSON.stringify(vid) + ")", function(y) {
+      root.page("window.__nicYtm.lyrics(" + JSON.stringify(vid) + ")", function(y, err) {
         if (y && y.text) done({ synced: false, lines: root.plainLines(y.text), source: y.source || "YouTube Music" })
-        else done(lr || { none: true })
+        else { if (err || !y) ctx.failed = true; done(lr || { none: true }) }
       })
     }
-    lrclibLookup(ss, function(lr) { got.lr = lr || null; settle() })
-    kugouLookup(ss, function(kg) { got.kg = kg || null; settle() })
+    lrclibLookup(ss, function(lr) { got.lr = lr || null; settle() }, ctx)
+    kugouLookup(ss, function(kg) { got.kg = kg || null; settle() }, ctx)
   }
   function applyLyrics(res) {
     lyricLines = res && res.lines ? res.lines : []
@@ -1759,7 +2013,7 @@ Panel {
   // (LyricsX, LDDC). There is no zlib in the shell's JS, so inflate() below
   // is a small port of zlib's puff.c. All of it runs only when a song's
   // lyrics are fetched, never at load (see Page.js on why that matters).
-  function kugouLookup(ss, cb) {
+  function kugouLookup(ss, cb, ctx) {
     var enc = encodeURIComponent
     var title = String(ss.title || "")
     var clean = title.replace(/\s*[\(\[](feat\.?|ft\.?|with)[^\)\]]*[\)\]]/ig, "").trim()
@@ -1767,7 +2021,7 @@ Panel {
     var dur = Math.round(Number(ss.songDuration || 0))
     if (!clean || !first) { cb(null); return }
     lyricsGet("https://krcs.kugou.com/search?ver=1&man=yes&client=mobi&keyword=" + enc(first + " - " + clean)
-      + "&duration=" + (dur * 1000) + "&hash=", function(d) {
+      + "&duration=" + (dur * 1000) + "&hash=", ctx, function(d) {
         // Only a candidate with the same title and artist and a length within
         // 3 s: a wrong song's words are worse than LRCLIB's lines.
         var best = null, cs = d && d.candidates ? d.candidates : []
@@ -1780,7 +2034,7 @@ Panel {
         }
         if (!best) { cb(null); return }
         root.lyricsGet("https://lyrics.kugou.com/download?ver=1&client=pc&fmt=krc&charset=utf8&id=" + enc(best.c.id)
-          + "&accesskey=" + enc(best.c.accesskey), function(x) {
+          + "&accesskey=" + enc(best.c.accesskey), ctx, function(x) {
             var lines = null
             try {
               if (x && x.content) lines = root.parseKrc(root.krcText(x.content), clean, first)
@@ -1838,8 +2092,17 @@ Panel {
   }
   // Raw DEFLATE (RFC 1951) from byte pos of src, the way zlib's puff.c does
   // it: one bit at a time, slow but tiny, and a song's lyrics are about 20 KB.
+  //
+  // The output stops at inflateMax. The answer is capped at 2 MiB by curl, but
+  // DEFLATE packs up to about 1000:1, so a 2 KB answer can ask for megabytes
+  // and a 2 MiB one for gigabytes, all built here on the shell's UI thread
+  // (a 19 KB stream gave 20 MB in 2.2 s and 569 MB of memory, deep review
+  // 2026-10-01). Past the cap it throws; kugouLookup then falls back to
+  // LRCLIB like for any unreadable answer.
+  readonly property int inflateMax: 1024 * 1024
   function inflate(src, pos) {
-    var out = [], bitbuf = 0, bitcnt = 0
+    var out = [], bitbuf = 0, bitcnt = 0, max = root.inflateMax
+    var tooBig = function() { throw new Error("inflate: output over 1 MiB") }
     var LBASE = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258]
     var LEXT = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0]
     var DBASE = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073,
@@ -1881,11 +2144,12 @@ Panel {
     var codes = function(lencode, distcode) {
       for (;;) {
         var sym = decode(lencode)
-        if (sym < 256) { out.push(sym); continue }
+        if (sym < 256) { if (out.length >= max) tooBig(); out.push(sym); continue }
         if (sym === 256) return
         sym -= 257
         if (sym >= 29) throw new Error("inflate: bad length")
         var len = LBASE[sym] + bits(LEXT[sym])
+        if (out.length + len > max) tooBig()
         var ds = decode(distcode)
         if (ds >= 30) throw new Error("inflate: bad distance")
         var from = out.length - DBASE[ds] - bits(DEXT[ds])
@@ -1904,6 +2168,7 @@ Panel {
         var n = src[pos] | (src[pos + 1] << 8)
         pos += 4
         if (pos + n > src.length) throw new Error("inflate: data ends early")
+        if (out.length + n > max) tooBig()
         for (i = 0; i < n; i++) out.push(src[pos++])
       } else if (type === 1) {
         var fl = [], fd = []
@@ -2112,29 +2377,48 @@ Panel {
       id: fetchProc
       property var done: null
       stdout: StdioCollector { id: fetchOut; waitForEnd: true }
-      onExited: function(exitCode) { root.lyricsFetched(fetchProc, exitCode === 0 ? fetchOut.text : "") }
+      // curl's own error line, then the HTTP status (-w %{stderr}).
+      stderr: StdioCollector { id: fetchErr; waitForEnd: true }
+      onExited: function(exitCode) { root.lyricsFetched(fetchProc, exitCode === 0 ? fetchOut.text : "", exitCode, fetchErr.text) }
     }
   }
-  function lyricsGet(url, cb) {
-    var cmd = ["curl", "-fsS", "--proto", "=https", "--max-time", "8", "--max-filesize", String(root.lyricsMaxBytes)]
+  // ctx (optional) is marked failed when this fetch failed for any reason but
+  // the service saying "not found" (see loadLyrics).
+  function lyricsGet(url, ctx, cb) {
+    var cmd = ["curl", "-fsS", "--proto", "=https", "--max-time", "8", "--max-filesize", String(root.lyricsMaxBytes),
+      "-w", "%{stderr}%{http_code}\n"]
     // LRCLIB asks clients to name themselves.
     if (url.indexOf("https://lrclib.net/") === 0)
       cmd = cmd.concat(["-H", "Lrclib-Client: nic.youtube-music (Omarchy bar widget)"])
-    var p = lyricsFetch.createObject(root, { command: cmd.concat(["--", url]), done: cb })
+    // ctx rides in the closure: an object handed to createObject arrives as a
+    // copy, so marking it there never reached loadLyrics.
+    var p = lyricsFetch.createObject(root, { command: cmd.concat(["--", url]),
+      done: function(d, failed) { if (failed && ctx) ctx.failed = true; cb(d) } })
     root.lyricsFetches = root.lyricsFetches.concat([p])
     p.running = true
     lyricsTimeout.restart()
   }
-  function lyricsFetched(p, text) {
+  // A fetch counts as an answer when curl succeeded, or when the service said
+  // the song is not there (HTTP 4xx, except 408 and 429, which only mean
+  // "later"). Anything else (exit 6/7 no network, 28 timeout, 63 too big, a
+  // 5xx, a kill by lyricsTimeout) is a failure.
+  function lyricsFetchFailed(code, err) {
+    if (code === 0) return false
+    var lines = String(err || "").trim().split("\n")
+    var http = Number(lines[lines.length - 1])
+    return !(code === 22 && http >= 400 && http < 500 && http !== 408 && http !== 429)
+  }
+  function lyricsFetched(p, text, code, err) {
     root.lyricsFetches = root.lyricsFetches.filter(function(o) { return o !== p })
     if (!root.lyricsFetches.length) lyricsTimeout.stop()
     var d = null
     if (text) { try { d = JSON.parse(text) } catch (e) {} }
+    var failed = root.lyricsFetchFailed(code, err) || (code === 0 && !d)
     var cb = p.done
     p.done = null
     // Not destroyed from inside its own exited handler.
     Qt.callLater(function() { p.destroy() })
-    if (cb) cb(d)
+    if (cb) cb(d, failed)
   }
   // A lookup that hangs (a dead connection after a network change, see
   // ArtImage) is given up 8 s after the last one started, and the next
@@ -2143,21 +2427,21 @@ Panel {
     id: lyricsTimeout; interval: 8000
     onTriggered: { var ps = root.lyricsFetches; for (var i = 0; i < ps.length; i++) ps[i].running = false }
   }
-  function lrclibLookup(ss, cb) {
+  function lrclibLookup(ss, cb, ctx) {
     var q = function(k, v) { return k + "=" + encodeURIComponent(v) }
     var title = String(ss.title || "")
     var artist = String(ss.artist || "")
     var dur = Math.round(Number(ss.songDuration || 0))
     var url = "https://lrclib.net/api/get?" + q("artist_name", artist) + "&" + q("track_name", title)
       + (ss.album ? "&" + q("album_name", ss.album) : "") + (dur > 0 ? "&" + q("duration", dur) : "")
-    lyricsGet(url, function(d) {
+    lyricsGet(url, ctx, function(d) {
       var plain = d && d.plainLyrics ? { synced: false, lines: root.plainLines(d.plainLyrics), source: "LRCLIB" } : null
       if (d && d.syncedLyrics) { cb({ synced: true, lines: root.parseLrc(d.syncedLyrics), source: "LRCLIB" }); return }
       // No exact match: search by a cleaned title and the first artist, and
       // take the closest length within 3 s that has timed lines.
       var clean = title.replace(/\s*[\(\[](feat\.?|ft\.?|with)[^\)\]]*[\)\]]/ig, "").trim()
       var first = artist.split(/\s*(?:,|&| x | feat\.? | ft\.? )\s*/i)[0]
-      root.lyricsGet("https://lrclib.net/api/search?" + q("track_name", clean) + "&" + q("artist_name", first), function(list) {
+      root.lyricsGet("https://lrclib.net/api/search?" + q("track_name", clean) + "&" + q("artist_name", first), ctx, function(list) {
         var best = null
         if (list && list.length) for (var i = 0; i < list.length; i++) {
           var e = list[i]
@@ -2228,11 +2512,21 @@ Panel {
   }
   // With word timing the clock runs every frame while music plays, so a word
   // fills smoothly; 20 steps a second showed as steps. Only the sung line's
-  // words read it.
+  // words read it. At most about 60 times a second, though: on a 144 or
+  // 165 Hz monitor every frame re-ran the sung line's bindings for no
+  // visible gain (deep review 2026-10-01). wordFrameDue() lets a frame
+  // through once 1/60 s (less a millisecond of slack) has gone by.
+  property real wordFrameAcc: 0
+  function wordFrameDue(dt) {
+    wordFrameAcc += Math.max(0, dt)
+    if (wordFrameAcc < 1 / 60 - 0.001) return false
+    wordFrameAcc = 0
+    return true
+  }
   FrameAnimation {
     id: wordFrames
     running: root.lyricsLive && root.lyricsWords && root.lyricsAnchor.playing
-    onTriggered: root.tickLyrics()
+    onTriggered: if (root.wordFrameDue(frameTime)) root.tickLyrics()
   }
   // Words light a touch ahead of the voice, as they do in Apple Music.
   readonly property real wordLead: 0.05
@@ -2245,6 +2539,12 @@ Panel {
     lyricIndex = i
   }
 
+  // Reads searchText itself, not the searching binding: clearing the search
+  // calls this from onSearchTextChanged, where Qt 6.11 still hands back the
+  // old value of a binding on searchText (the handler runs before the binding
+  // updates). It saw "still searching", ran an empty search that did nothing,
+  // and Home never came back (offline test through the keyboard, 2026-09-24;
+  // the same trap as in World Radio's memory note).
   function refresh() {
     if (!appUp) return
     checkOffline()
@@ -2255,10 +2555,112 @@ Panel {
     // Nothing to browse on the Queue tab. Drop any Home or Library load still
     // in flight and its error, so "The queue is empty." is not replaced by
     // another tab's message.
-    else if (view === "queue") { serial += 1; loading = false; loadingMore = false; moreToken = ""; listError = "" }
-    else if (view === "lyrics") { serial += 1; loading = false; loadingMore = false; moreToken = ""; listError = ""; loadLyrics() }
-    else if (view === "library") loadBrowse(libraryPage, "")
-    else loadBrowse("FEmusic_home", "")
+    else if (view === "queue") { serial += 1; loading = false; loadingMore = false; moreToken = ""; listError = ""; listFailed = false }
+    else if (view === "lyrics") { serial += 1; loading = false; loadingMore = false; moreToken = ""; listError = ""; listFailed = false; loadLyrics() }
+    else if (view === "library") showTop(libraryPage)
+    else showTop("FEmusic_home")
+  }
+
+  // Home and the Library pages are kept for browseCacheMs (asked for
+  // 2026-10-01): each panel open and each tab switch fetched them again,
+  // Home in six requests, with "Loading…" every time. A kept list now shows
+  // at once with no spinner and no fetch; once it is older than 10 minutes
+  // it still shows at once and a fresh copy loads quietly behind it (see
+  // quietRefresh). Only these top-level lists: albums, playlists and artists
+  // opened from them, and searches, always load. Pages loaded further down
+  // (paging) are kept too.
+  property var browseCache: ({})        // browseId -> {sections, header, moreToken, morePath, at}
+  readonly property int browseCacheMs: 10 * 60 * 1000
+  // The browseId of the top-level list on screen now, or "".
+  function topKey() {
+    if (searching || currentPage) return ""
+    if (view === "home") return "FEmusic_home"
+    if (view === "library") return libraryPage
+    return ""
+  }
+  function keepTop(id, at) {
+    if (!id || !sections.length) return
+    var c = browseCache
+    var old = c[id]
+    c[id] = { sections: sections, header: pageHeader, moreToken: moreToken, morePath: morePath,
+      at: at !== undefined ? at : (old ? old.at : Date.now()) }
+    browseCache = c
+  }
+  function dropTop(id) { var c = browseCache; delete c[id]; browseCache = c }
+  // Signed out (or into another account): nothing kept is theirs.
+  onSignedInChanged: if (!signedIn) browseCache = ({})
+  // Test hook: make every kept list look ms older.
+  function ageBrowseCache(ms) { for (var k in browseCache) browseCache[k].at -= ms }
+  function showTop(id) {
+    var c = browseCache[id]
+    if (!c) { loadBrowse(id, ""); return }
+    serial += 1
+    loading = false
+    loadingMore = false
+    listError = ""
+    listFailed = false
+    pageHeader = c.header
+    setList(c.sections, "", c.morePath)
+    moreToken = c.moreToken
+    moreEager = id === "FEmusic_home" && moreToken !== ""
+    if (ageMs(c.at) >= browseCacheMs) quietRefresh(id)
+  }
+  // A fresh copy of a kept list, fetched without touching the one on screen
+  // (Home with all its slices). It replaces the list on screen only while
+  // that list is still showing and scrolled to the top, so nothing moves
+  // under the reader; otherwise it waits in the cache for the next visit.
+  property int quietSerial: 0
+  function quietRefresh(id) {
+    quietSerial += 1
+    var mine = quietSerial
+    var secs = [], keys = {}, header = null
+    var add = function(list) {
+      for (var i = 0; i < list.length; i++) {
+        var its = []
+        for (var j = 0; j < list[i].items.length; j++) {
+          var k = root.rowKey(list[i].items[j])
+          if (keys[k]) continue
+          keys[k] = true
+          its.push(list[i].items[j])
+        }
+        if (its.length) secs.push({ title: list[i].title, items: its, more: list[i].more, cont: list[i].cont })
+      }
+    }
+    var finish = function(token) {
+      if (mine !== root.quietSerial || !secs.length) return
+      var c = root.browseCache
+      c[id] = { sections: secs, header: header, moreToken: token, morePath: "/browse", at: Date.now() }
+      root.browseCache = c
+      if (root.topKey() === id && !root.loading && list.contentY <= list.originY + 1) root.showTop(id)
+    }
+    // Home's further slices, as loadMore would fetch them (at most 10).
+    var more = function(token, left) {
+      if (!token || left <= 0) { finish(token || ""); return }
+      root.page("window.__nicYtm.more(" + JSON.stringify("/browse") + "," + JSON.stringify(token) + ")", function(v) {
+        if (mine !== root.quietSerial) return
+        if (!v || v.error) { finish(token); return }
+        if (v.items && v.items.length) add([{ title: "", items: v.items }])
+        add(v.sections || [])
+        more(v.cont || "", left - 1)
+      })
+    }
+    page("window.__nicYtm.browse(" + JSON.stringify(id) + "," + JSON.stringify("") + ")", function(v) {
+      if (mine !== root.quietSerial || !v || v.error) return
+      header = v.header
+      add(v.sections || [])
+      var last = secs.length ? secs[secs.length - 1] : null
+      var token = (last && last.cont) || v.cont || ""
+      if (id === "FEmusic_home") more(token, 10)
+      else finish(token)
+    })
+  }
+
+  // The list area's Try again. On pear's offline page, point the page back
+  // at YouTube Music now rather than at the next 10 s retry.
+  function retryList() {
+    if (appOffline) lastPageRetry = 0
+    if (appOffline) retryAppPage()
+    refresh()
   }
 
   function loadBrowse(browseId, params) {
@@ -2269,6 +2671,7 @@ Panel {
     moreToken = ""
     moreEager = browseId === "FEmusic_home"
     listError = ""
+    listFailed = false
     // Drop the last page's header, or the back bar shows the previous album's
     // title while this one loads (and keeps it if this one fails).
     pageHeader = null
@@ -2276,10 +2679,11 @@ Panel {
       if (mine !== root.serial) return
       root.loading = false
       // Page.js answers {error: "<sentence>"} on failure (never a raw "Object").
-      if (!v || v.error) { root.listError = (v && v.error) || err || "Could not load this page."; root.setList([], "", "/browse"); return }
+      if (!v || v.error) { root.listError = (v && v.error) || err || "Could not load this page."; root.listFailed = true; root.setList([], "", "/browse"); return }
       root.pageHeader = v.header
       root.setList(v.sections || [], v.cont || "", "/browse")
-      if (root.sections.length === 0) root.listError = root.signedIn ? "Nothing here yet" : "Sign in inside the YouTube Music app to see your library."
+      if (!params && root.topKey() === browseId) root.keepTop(browseId, Date.now())
+      if (root.sections.length === 0) root.listError = root.signedIn ? "Nothing here yet." : "Sign in inside the YouTube Music app to see your library."
     })
   }
 
@@ -2297,11 +2701,13 @@ Panel {
     moreToken = ""
     moreEager = false
     listError = ""
+    listFailed = false
     page("window.__nicYtm.search(" + JSON.stringify(q) + "," + JSON.stringify(filter) + ")", function(v, err) {
       if (mine !== root.serial) return
       root.loading = false
       if (!v || v.error) {
         root.listError = (v && v.error) || err || "Search failed."
+        root.listFailed = true
         root.setList([], "", "/search")
         root.openFirstPending = false
         return
@@ -2429,6 +2835,7 @@ Panel {
       list.keepY = list.contentY
       root.sections = secs
       list.keepY = -1
+      root.keepTop(root.topKey())
       loadMoreSoon.restart()
     })
   }
@@ -2451,7 +2858,7 @@ Panel {
       // Keep the list being left as it is (every page loaded so far and the
       // scroll position), so Back lands on the same row instead of page one.
       var back = { sections: sections, pageHeader: pageHeader, moreToken: moreToken, morePath: morePath,
-        moreEager: moreEager, rowKeys: rowKeys, y: list.contentY, listError: listError }
+        moreEager: moreEager, rowKeys: rowKeys, y: list.contentY, listError: listError, listFailed: listFailed }
       // Keep the tile's own play endpoint (album and playlist tiles carry one),
       // and drop the list being left. While the new page loaded, the Play
       // button used the old rows and started their first song, and the old
@@ -2480,6 +2887,7 @@ Panel {
     loading = false
     loadingMore = false
     listError = b.listError
+    listFailed = !!b.listFailed
     pageHeader = b.pageHeader
     rowKeys = b.rowKeys
     morePath = b.morePath
@@ -2557,13 +2965,27 @@ Panel {
   //    and it is added again after a config reload, which drops runtime
   //    rules. A matching rule in hyprland.lua does no harm.
   readonly property string appPath: "/opt/YouTube Music/youtube-music"
+  // The setup screen's notes. A word joiner (U+2060) on each side of the
+  // hyphens in package names keeps them on one line: the text broke as
+  // "(pear-" / "desktop)". It is invisible, and a font without it (the
+  // shell's MartianMono) draws nothing for it.
+  readonly property string installText: "This widget is a remote for the YouTube Music desktop app (pear\u2060-\u2060desktop). "
+    + "Install opens a terminal where yay installs pear\u2060-\u2060desktop\u2060-\u2060bin from the AUR and asks you to confirm. "
+    + "This screen moves on by itself when it's done."
+  // Everything tools/setup changes, so "nothing else" is true.
+  readonly property string setupText: "Set up turns on the app's local API (on 127.0.0.1 only) and locks it to this widget "
+    + "with a private token. It turns off the app's tray, start at login, resume on start and its own updater "
+    + "(the widget does the resuming, the package manager the updates), takes any old debugging lines out of "
+    + "~/.config/youtube-music-flags.conf (keeping a backup next to it), "
+    + "and adds a YouTube Music menu entry. The app starts and quits once while it runs. Nothing else changes. "
+    + "Sign in inside the app afterwards if it asks."
   // Assumed installed until checked, so a normal start never flashes the
   // install screen.
   property bool appInstalled: true
   property bool setupRunning: false
   property string setupError: ""
   readonly property bool needsSetup: appInstalled && tokenChecked && apiToken === "" && !appUp
-  readonly property bool setupScreen: !appInstalled || needsSetup || setupRunning
+  readonly property bool setupScreen: !appInstalled || needsSetup || setupRunning || (tokenRejected && !appUp)
   function checkInstalled() { if (!installCheck.running) installCheck.running = true }
   Process {
     id: installCheck
@@ -2634,8 +3056,30 @@ Panel {
 
   property string toastText: ""
   function toast(t) { toastFor(t, 2600) }
-  function toastFor(t, ms) { toastText = t; toastTimer.interval = ms; toastTimer.restart() }
-  Timer { id: toastTimer; interval: 2600; onTriggered: root.toastText = "" }
+  // A message shows in the toast of whichever monitor's panel is open. With
+  // no panel open it was drawn in a closed panel and nobody saw it (a play
+  // from the bar or a media key on an app that is not set up, a song that
+  // is gone, a start that failed; deep review 2026-10-01). It is then a plain
+  // desktop notification: the text is notify-send's summary, which the
+  // notification spec defines as plain text, passed as one argument after
+  // "--", so nothing in a song title reads as an option.
+  // action (optional): {label, run}, a button in the toast.
+  function toastFor(t, ms, action) {
+    var ps = peers()
+    for (var i = 0; i < ps.length; i++) if (ps[i] && ps[i] !== root && ps[i].opened) { ps[i].showToast(t, ms, action); return }
+    if (opened) { showToast(t, ms, action); return }
+    Quickshell.execDetached(["notify-send", "--app-name=YouTube Music", "--", String(t)])
+  }
+  property string toastActionLabel: ""
+  property var toastAction: null
+  function showToast(t, ms, action) {
+    toastText = t
+    toastActionLabel = action ? action.label : ""
+    toastAction = action ? action.run : null
+    toastTimer.interval = ms
+    toastTimer.restart()
+  }
+  Timer { id: toastTimer; interval: 2600; onTriggered: { root.toastText = ""; root.toastActionLabel = ""; root.toastAction = null } }
 
   function fmt(sec) {
     sec = Math.max(0, Math.floor(sec || 0))
@@ -2768,6 +3212,27 @@ Panel {
     else if (button === Qt.MiddleButton) { if (hasSong) next() }
     else toggle()
   }
+  // Scrolling on the bar skips songs: up = previous, down = next (asked for
+  // 2026-10-01; Omarchy's own media widget does the same). One skip per 120
+  // units (a mouse notch); after a skip, nothing more until the wheel has
+  // been still for 300 ms, so one trackpad flick (dozens of small events) is
+  // one skip, not ten. Only with one of the user's songs loaded: a scroll
+  // never starts the app or music.
+  property real wheelAcc: 0
+  Timer { id: wheelQuiet; interval: 300 }
+  Timer { id: wheelForget; interval: 400; onTriggered: root.wheelAcc = 0 }
+  function wheelStep(dy) {
+    if (wheelQuiet.running) { wheelQuiet.restart(); wheelAcc = 0; return }
+    if (!songLive) { wheelAcc = 0; return }
+    wheelAcc += dy
+    wheelForget.restart()
+    if (Math.abs(wheelAcc) < 120) return
+    var up = wheelAcc > 0
+    wheelAcc = 0
+    wheelQuiet.restart()
+    if (up) previous()
+    else next()
+  }
   // appShown starts false after a shell restart even if the app is on screen.
   Component.onCompleted: readAppShown()
 
@@ -2861,6 +3326,7 @@ Panel {
     cursorShape: Qt.PointingHandCursor
     acceptedButtons: Qt.LeftButton | Qt.RightButton | Qt.MiddleButton
     onClicked: function(mouse) { root.triggerPress(mouse.button) }
+    onWheel: function(wheel) { root.wheelStep(wheel.angleDelta.y); wheel.accepted = true }
     onEntered: if (root.bar && !root.opened) root.bar.showTooltip(root, root.barTip())
     onExited: if (root.bar) root.bar.hideTooltip(root)
   }
@@ -2900,12 +3366,29 @@ Panel {
     "lh3.googleusercontent.com": ["lh4.googleusercontent.com", "lh5.googleusercontent.com", "lh6.googleusercontent.com"],
     "i.ytimg.com": ["i1.ytimg.com", "i2.ytimg.com", "i3.ytimg.com"]
   })
+  // Whether a URL is https on one of Google's image hosts (the ones above, the
+  // twins they retry on, and www.gstatic.com, which serves a few covers).
+  function artHostOk(h) {
+    if (h === "www.gstatic.com") return true
+    for (var k in artHosts) if (k === h || artHosts[k].indexOf(h) >= 0) return true
+    return false
+  }
+  function artUrlOk(u) {
+    var m = /^https:\/\/([A-Za-z0-9.-]+)(\/\S*)?$/.exec(typeof u === "string" ? u : "")
+    return !!m && artHostOk(m[1].toLowerCase())
+  }
   // The URL for try number `attempt` (0 = as given). Hosts without known
   // twins (www.gstatic.com) just ask again, which works once Qt has dropped
   // the dead connection.
+  //
+  // Only https URLs on Google's image hosts load at all (anything else gives
+  // ""). The shell fetches every image itself, and the URLs come from
+  // YouTube's data, the app's API and last.json: a file:// or plain-http URL
+  // there was loaded as given (deep review 2026-10-01).
   function artAt(url, attempt) {
     url = String(url || "")
-    if (!attempt || url === "") return url
+    if (!artUrlOk(url)) return ""
+    if (!attempt) return url
     var m = /^https:\/\/([^\/]+)(\/.*)$/.exec(url)
     var alts = m ? artHosts[m[1]] : null
     if (!alts) return url + (url.indexOf("?") < 0 ? "?" : "&") + "try=" + attempt
@@ -3022,6 +3505,7 @@ Panel {
 
     PanelKeyCatcher {
       id: keys
+      objectName: "keyCatcher"
       anchors.fill: parent
       // While the search field has focus it owns the keyboard (its Keys
       // handler does Enter, Esc and Down). Otherwise keys the field passes on
@@ -3047,7 +3531,13 @@ Panel {
         spaceGuard.restart()
         root.playPause()
       }
-      onMoveRequested: function(dx, dy) { if (dy !== 0) root.moveCursor(dy) }
+      // Up and Down pick a row; Left and Right seek 10 s (asked for
+      // 2026-10-01). The catcher is blocked while the search field has
+      // focus, so there they still move the text cursor.
+      onMoveRequested: function(dx, dy) {
+        if (dy !== 0) root.moveCursor(dy)
+        else if (dx !== 0) root.seekBy(10 * dx)
+      }
       // Tab and Shift+Tab move to the next bar panel, like the built-in panels.
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(t) { if (t === "/") searchField.forceActiveFocus() }
@@ -3061,11 +3551,17 @@ Panel {
         visible: backdrop.status === Image.Ready && root.hasSong
         ArtImage {
           id: backdrop
+          objectName: "backdropArt"
           anchors.fill: parent
           url: root.artUrl
           fillMode: Image.PreserveAspectCrop
           asynchronous: true
           visible: false
+          // Decoded at about the big cover's size, not the file's: it is
+          // blurred anyway, and a full-size decode of whatever the URL holds
+          // has no other limit (Qt's own cap is 256 MB).
+          sourceSize.width: Style.space(544)
+          sourceSize.height: Style.space(544)
         }
         MultiEffect {
           anchors.fill: parent
@@ -3102,7 +3598,8 @@ Panel {
           textFormat: Text.PlainText
           text: !root.appInstalled ? "YouTube Music isn't installed"
             : root.setupRunning ? "Setting up YouTube Music…"
-            : root.setupError !== "" ? "Setup didn't finish" : "One step before it works"
+            : root.setupError !== "" ? "Setup didn't finish"
+            : root.tokenRejected ? "Run Set up again" : "One step before it works"
           color: root.fg
           font.family: root.fontFamily
           font.pixelSize: Style.font.subtitle
@@ -3113,11 +3610,11 @@ Panel {
           horizontalAlignment: Text.AlignHCenter
           wrapMode: Text.Wrap
           textFormat: Text.PlainText
-          text: !root.appInstalled
-            ? "This widget is a remote for the YouTube Music desktop app (pear-desktop). Install opens a terminal where yay installs pear-desktop-bin from the AUR and asks you to confirm. This screen moves on by itself when it's done."
+          text: !root.appInstalled ? root.installText
             : root.setupRunning ? "The app starts and quits once while this runs. It takes about half a minute."
             : root.setupError !== "" ? root.setupError
-            : "Set up turns on the app's local API and locks it to this widget with a private token, turns off the app's tray and start-at-login, and adds a YouTube Music menu entry. It doesn't touch anything else. Sign in inside the app afterwards if it asks."
+            : root.tokenRejected ? "The app turned down this widget's key, so the widget can't control it. Its settings may have been reset. Set up gives the widget a new key."
+            : root.setupText
           color: root.a(root.fg, 0.6)
           font.family: root.fontFamily
           font.pixelSize: Style.font.bodySmall
@@ -3168,7 +3665,7 @@ Panel {
           wrapMode: Text.Wrap
           textFormat: Text.PlainText
           text: root.startFailed ? "Try again. If it keeps failing, start the YouTube Music app from the launcher."
-            : !wakingCol.waking ? "Start it again to keep listening."
+            : !wakingCol.waking ? root.closedHint
             : (root.pendingAction === "play" && root.hasSong ? "Picking up " + root.title + " where you left off."
               : "It runs in the background and closes itself when you're done.")
           color: root.a(root.fg, 0.6)
@@ -3204,11 +3701,15 @@ Panel {
             color: root.a(root.fg, 0.06)
             ArtImage {
               id: art
+              objectName: "coverArt"
               anchors.fill: parent
               url: root.artUrl
               fillMode: Image.PreserveAspectCrop
               asynchronous: true
               visible: status === Image.Ready
+              // Drawn 270 px wide; 544 keeps it sharp at scale 2.
+              sourceSize.width: Style.space(544)
+              sourceSize.height: Style.space(544)
             }
             Text {
               anchors.centerIn: parent
@@ -3390,7 +3891,6 @@ Panel {
                   anchors.fill: parent
                   radius: width / 2
                   color: Color.accent
-                  opacity: root.hasSong ? 1 : 0.4
                   scale: playMouse.pressed ? 0.92 : (playMouse.containsMouse ? 1.05 : 1)
                   Behavior on scale { NumberAnimation { duration: 110; easing.type: Easing.OutCubic } }
                   Text {
@@ -3405,13 +3905,16 @@ Panel {
                 }
                 MouseArea {
                   id: playMouse
+                  objectName: "roundPlay"
                   anchors.fill: parent
                   hoverEnabled: true
-                  enabled: root.hasSong
+                  // Always on: with nothing loaded or remembered, play starts
+                  // Liked songs, as a right click on the bar and the play key
+                  // do (it was dimmed and disabled then).
                   cursorShape: Qt.PointingHandCursor
                   onClicked: root.playPause()
                 }
-                HoverTip { shown: playMouse.containsMouse; text: root.isPlaying ? "Pause" : "Play" }
+                HoverTip { shown: playMouse.containsMouse; text: root.isPlaying ? "Pause" : (root.hasSong ? "Play" : "Play Liked songs") }
               }
               IconBtn {
                 anchors.verticalCenter: parent.verticalCenter
@@ -3622,6 +4125,7 @@ Panel {
 
           TextField {
             id: searchField
+            objectName: "searchField"
             width: parent.width
             placeholderText: "Search songs, albums, artists and playlists (press /)"
             font.family: root.fontFamily
@@ -3755,6 +4259,7 @@ Panel {
             height: parent.height - y
 
             Text {
+              id: listMsg
               anchors.centerIn: parent
               width: parent.width - Style.space(40)
               horizontalAlignment: Text.AlignHCenter
@@ -3770,6 +4275,19 @@ Panel {
               color: root.a(root.fg, 0.55)
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
+            }
+            // Only re-clicking a tab retried before (deep review 2026-10-01).
+            // Above the (empty) ListView, which fills the same area and would
+            // take the click otherwise.
+            Button {
+              z: 2
+              anchors.top: listMsg.bottom
+              anchors.topMargin: Style.space(12)
+              anchors.horizontalCenter: parent.horizontalCenter
+              visible: listMsg.visible && !root.loading && (root.appOffline || root.listFailed)
+              text: "Try again"
+              bordered: true
+              onClicked: root.retryList()
             }
 
             ListView {
@@ -4352,22 +4870,42 @@ Panel {
         visible: opacity > 0
         opacity: root.toastText !== "" ? 1 : 0
         Behavior on opacity { NumberAnimation { duration: 160 } }
-        width: toastT.width + Style.space(24)
-        height: toastT.implicitHeight + Style.space(12)
+        width: toastRow.width + Style.space(24)
+        height: Math.max(toastT.implicitHeight, toastBtn.visible ? toastBtn.height : 0) + Style.space(12)
         radius: height / 2
         color: Color.popups.background
         border.width: 1
         border.color: root.a(Color.accent, 0.6)
-        Text {
-          id: toastT
+        Row {
+          id: toastRow
           anchors.centerIn: parent
-          width: Math.min(implicitWidth, Math.max(0, keys.width - Style.space(64)))
-          elide: Text.ElideRight
-          textFormat: Text.PlainText
-          text: root.toastText
-          color: root.fg
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.caption
+          spacing: Style.space(10)
+          Text {
+            id: toastT
+            anchors.verticalCenter: parent.verticalCenter
+            width: Math.min(implicitWidth, Math.max(0, keys.width - Style.space(64) - (toastBtn.visible ? toastBtn.width + toastRow.spacing : 0)))
+            elide: Text.ElideRight
+            textFormat: Text.PlainText
+            text: root.toastText
+            color: root.fg
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+          Button {
+            id: toastBtn
+            anchors.verticalCenter: parent.verticalCenter
+            visible: root.toastActionLabel !== ""
+            text: root.toastActionLabel
+            fontSize: Style.font.caption
+            bordered: true
+            onClicked: {
+              var run = root.toastAction
+              root.toastText = ""
+              root.toastActionLabel = ""
+              root.toastAction = null
+              if (run) run()
+            }
+          }
         }
       }
     }
