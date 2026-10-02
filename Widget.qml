@@ -1392,8 +1392,13 @@ Panel {
       { label: "Set up", run: function() { root.runSetup() } })
   }
 
+  // The app was up at some point in this session. "Start it again" read
+  // wrong right after a first install, when nothing had played yet.
+  property bool appEverUp: false
+  readonly property string closedHint: appEverUp ? "Start it again to keep listening." : "Start it to listen. It runs in the background."
   function markUp() {
     appUp = true
+    appEverUp = true
     tokenRefusals = 0
     tokenRejected = false
     launchedApp = false
@@ -2677,7 +2682,7 @@ Panel {
       root.pageHeader = v.header
       root.setList(v.sections || [], v.cont || "", "/browse")
       if (!params && root.topKey() === browseId) root.keepTop(browseId, Date.now())
-      if (root.sections.length === 0) root.listError = root.signedIn ? "Nothing here yet" : "Sign in inside the YouTube Music app to see your library."
+      if (root.sections.length === 0) root.listError = root.signedIn ? "Nothing here yet." : "Sign in inside the YouTube Music app to see your library."
     })
   }
 
@@ -2959,6 +2964,19 @@ Panel {
   //    and it is added again after a config reload, which drops runtime
   //    rules. A matching rule in hyprland.lua does no harm.
   readonly property string appPath: "/opt/YouTube Music/youtube-music"
+  // The setup screen's notes. A word joiner (U+2060) on each side of the
+  // hyphens in package names keeps them on one line: the text broke as
+  // "(pear-" / "desktop)". It is invisible, and a font without it (the
+  // shell's MartianMono) draws nothing for it.
+  readonly property string installText: "This widget is a remote for the YouTube Music desktop app (pear\u2060-\u2060desktop). "
+    + "Install opens a terminal where yay installs pear\u2060-\u2060desktop\u2060-\u2060bin from the AUR and asks you to confirm. "
+    + "This screen moves on by itself when it's done."
+  // Everything tools/setup changes, so "nothing else" is true.
+  readonly property string setupText: "Set up turns on the app's local API (on 127.0.0.1 only) and locks it to this widget "
+    + "with a private token. It turns off the app's tray, start at login and resume on start (the widget does the resuming), "
+    + "takes any old debug-port lines out of ~/.config/youtube-music-flags.conf (keeping a backup next to it), "
+    + "and adds a YouTube Music menu entry. The app starts and quits once while it runs. Nothing else changes. "
+    + "Sign in inside the app afterwards if it asks."
   // Assumed installed until checked, so a normal start never flashes the
   // install screen.
   property bool appInstalled: true
@@ -3590,12 +3608,11 @@ Panel {
           horizontalAlignment: Text.AlignHCenter
           wrapMode: Text.Wrap
           textFormat: Text.PlainText
-          text: !root.appInstalled
-            ? "This widget is a remote for the YouTube Music desktop app (pear-desktop). Install opens a terminal where yay installs pear-desktop-bin from the AUR and asks you to confirm. This screen moves on by itself when it's done."
+          text: !root.appInstalled ? root.installText
             : root.setupRunning ? "The app starts and quits once while this runs. It takes about half a minute."
             : root.setupError !== "" ? root.setupError
             : root.tokenRejected ? "The app turned down this widget's key, so the widget can't control it. Its settings may have been reset. Set up gives the widget a new key."
-            : "Set up turns on the app's local API and locks it to this widget with a private token, turns off the app's tray and start-at-login, and adds a YouTube Music menu entry. It doesn't touch anything else. Sign in inside the app afterwards if it asks."
+            : root.setupText
           color: root.a(root.fg, 0.6)
           font.family: root.fontFamily
           font.pixelSize: Style.font.bodySmall
@@ -3646,7 +3663,7 @@ Panel {
           wrapMode: Text.Wrap
           textFormat: Text.PlainText
           text: root.startFailed ? "Try again. If it keeps failing, start the YouTube Music app from the launcher."
-            : !wakingCol.waking ? "Start it again to keep listening."
+            : !wakingCol.waking ? root.closedHint
             : (root.pendingAction === "play" && root.hasSong ? "Picking up " + root.title + " where you left off."
               : "It runs in the background and closes itself when you're done.")
           color: root.a(root.fg, 0.6)
