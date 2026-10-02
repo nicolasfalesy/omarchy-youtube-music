@@ -7,6 +7,12 @@ import time
 from ytmtest import Case, Conn, wait_until
 
 
+def switches(pid):
+    """Times the process went to sleep and woke (voluntary + forced)."""
+    with open("/proc/%d/status" % pid) as f:
+        return sum(int(line.split()[1]) for line in f if "ctxt_switches:" in line)
+
+
 def cpu_seconds(pid):
     fields = open("/proc/%d/stat" % pid).read().rsplit(")", 1)[1].split()
     return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
@@ -249,6 +255,31 @@ class BridgeTest(Case):
         c.send({"id": 1, "method": "Runtime.evaluate", "params": {"expression": "fake.newline"}})
         c.send({"id": 2, "method": "Runtime.evaluate", "params": {"expression": "1"}})
         self.assertEqual(c.recv()["id"], 2, "the broken answer is dropped whole, the next one arrives")
+
+    def test_an_idle_bridge_does_not_wake_up(self):
+        # It used to poll the app every second (a 1 s select timeout).
+        p = self.bridge_up()
+        Conn(self.sock).close()
+        time.sleep(0.5)
+        before = switches(p.pid)
+        time.sleep(3)
+        self.assertLessEqual(switches(p.pid) - before, 1)
+
+    def test_sigterm_stops_the_bridge_at_once(self):
+        p = self.bridge_up()
+        time.sleep(0.2)
+        t0 = time.monotonic()
+        p.terminate()
+        self.assertTrue(wait_until(lambda: not os.path.exists(self.sock), 0.5), "socket still there 0.5 s after SIGTERM")
+        p.wait(timeout=5)
+        self.assertLess(time.monotonic() - t0, 2)
+        self.assertTrue(wait_until(lambda: self.app_events("quit"), 2), "the app quit on its pipe closing")
+
+    def test_the_bridge_ends_when_the_app_dies(self):
+        p = self.bridge_up()
+        os.kill(self.app_events("start")[0]["pid"], 9)
+        self.assertEqual(p.wait(timeout=2), 0)
+        self.assertFalse(os.path.exists(self.sock))
 
 
 def race_once(case):

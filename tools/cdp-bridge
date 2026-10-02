@@ -295,6 +295,20 @@ def main():
     signal.signal(signal.SIGTERM, lambda *_: stopping.append(1))
     signal.signal(signal.SIGINT, lambda *_: stopping.append(1))
     signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+    # No polling: select wakes when the app exits (a pidfd turns readable)
+    # or a signal lands (set_wakeup_fd writes a byte). It used to wake every
+    # second to call waitpid. The wakeup pipe matters: Python retries an
+    # interrupted select on its own (PEP 475), so without it a SIGTERM went
+    # unnoticed until something else happened (2026-10-01 review).
+    wakers = []
+    try:
+        wakers.append(os.pidfd_open(pid))
+        wake_r, wake_w = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+        signal.set_wakeup_fd(wake_w)
+        wakers.append(wake_r)
+        tick = None
+    except (AttributeError, OSError):  # no pidfd (Linux before 5.3): poll as before
+        wakers, wake_r, tick = [], None, 1.0
 
     # Every connection is served at once. One copy of the widget runs per
     # monitor and each opens its own connection; when only the newest was
@@ -350,11 +364,17 @@ def main():
             done, _status = os.waitpid(pid, os.WNOHANG)
             if done:
                 break
-            watch = [server, from_app_r] + list(clients)
+            watch = [server, from_app_r] + wakers + list(clients)
             try:
-                ready, writable, _ = select.select(watch, [c for c in clients if outq[c]], [], 1.0)
+                ready, writable, _ = select.select(watch, [c for c in clients if outq[c]], [], tick)
             except InterruptedError:
                 continue
+            if wake_r is not None and wake_r in ready:
+                try:
+                    while os.read(wake_r, 64):
+                        pass
+                except BlockingIOError:
+                    pass
             for conn in [c for c in writable if c in clients]:
                 flush(conn)
             if server in ready:
