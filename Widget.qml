@@ -1515,8 +1515,14 @@ Panel {
     } else if (m.result && m.result.result) cb(m.result.result.value, "")
     else if (m.result && !m.error) cb(m.result, "")          // Page.navigate and Target.* answer plain objects
     else {
-      console.warn("nic.youtube-music page error:", JSON.stringify(m.error || m).slice(0, 2000))
-      cb(null, "The YouTube Music page did not answer. Try again.", m.error ? String(m.error.message || "") : "")
+      var raw = m.error ? String(m.error.message || "") : ""
+      // A page call that will be tried again (see pageAnswer) is logged only
+      // if the retry fails too: the first "Cannot find default execution
+      // context" is an expected step of every app start (it was most of the
+      // plugin's journal lines, deep review 2026-10-01).
+      if (!(cb.retriesContext && root.contextGone(raw)))
+        console.warn("nic.youtube-music page error:", JSON.stringify(m.error || m).slice(0, 2000))
+      cb(null, "The YouTube Music page did not answer. Try again.", raw)
     }
   }
   Timer {
@@ -1619,14 +1625,15 @@ Panel {
   // Every page answer passes here first. Page.js answers offlineText (the
   // same sentence, see safe() there) only on pear's offline page, so any list
   // load that meets it also starts the way back (noteOffline).
+  function contextGone(raw) { return /Cannot find default execution context/i.test(raw || "") }
   function pageAnswer(cb, expr, retried) {
-    return function(v, err, raw) {
+    var answer = function(v, err, raw) {
       // Right after the app starts, the page swaps its JS context once more
       // after it looks ready, and a call that lands then fails with "Cannot
       // find default execution context" without having run at all (seen
       // 2026-09-24 18:07 and 18:51). A resume or play hit by it failed with a
       // toast. Such a call is safe to repeat, so it goes again once, 0.5 s later.
-      if (!retried && raw && /Cannot find default execution context/i.test(raw)) {
+      if (!retried && root.contextGone(raw)) {
         root.pageRetries = root.pageRetries.concat([{ expr: expr, cb: cb }])
         pageRetryLater.restart()
         return
@@ -1634,6 +1641,8 @@ Panel {
       if (v && v.error === root.offlineText) root.noteOffline()
       if (cb) cb(v, err)
     }
+    answer.retriesContext = !retried
+    return answer
   }
   property var pageRetries: []
   Timer {
