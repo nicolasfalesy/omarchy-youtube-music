@@ -2,8 +2,9 @@
 """A stand-in for the app's REST API, for tests/qml only.
 
 tests/qml/run starts it inside the tests' own network namespace on
-127.0.0.1:26599 (never the app's port). /api/v1/endless streams junk until
-the client hangs up (about 32 MB/s); /api/v1/stats says how much went out,
+127.0.0.1:26599 (never the app's port). /api/v1/huge sends 64 MiB of junk;
+/api/v1/slow answers after 0.3 s; /api/v1/stats says how much of
+the huge answer went out,
 and counts every POST by path (POST /api/v1/reset clears the counts).
 """
 import http.server, json, socketserver, sys, time
@@ -26,24 +27,24 @@ class H(http.server.BaseHTTPRequestHandler):
             return self.send_json(stats)
         if self.path == "/api/v1/like-state":
             return self.send_json({"state": "LIKE"})
-        if self.path == "/api/v1/endless":
+        if self.path == "/api/v1/slow":
+            time.sleep(0.3)
+            return self.send_json({"state": "LIKE"})
+        if self.path == "/api/v1/huge":
             stats["hugeSent"] = 0
             stats["hugeDone"] = False
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
-            self.send_header("Transfer-Encoding", "chunked")
+            self.send_header("Content-Length", str(64 << 20))
             self.end_headers()
             chunk = b"x" * 65536
-            frame = b"%x\r\n" % len(chunk) + chunk + b"\r\n"
             try:
-                while stats["hugeSent"] < (1 << 30):
-                    self.wfile.write(frame)
+                for _ in range(1024):
+                    self.wfile.write(chunk)
                     stats["hugeSent"] += len(chunk)
-                    time.sleep(0.002)
                 stats["hugeDone"] = True
             except (BrokenPipeError, ConnectionResetError):
                 pass
-            self.close_connection = True
             return
         self.send_response(404)
         self.send_header("Content-Length", "0")

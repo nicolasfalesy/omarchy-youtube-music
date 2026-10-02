@@ -444,27 +444,29 @@ Panel {
     onFileChanged: reload()
   }
 
-  // Answers past restMaxChars are cut off. XMLHttpRequest has no size limit
-  // of its own and read the whole answer into the shell before parsing it on
-  // the UI thread (a 64 MiB answer was read in full, deep review
-  // 2026-10-01); the app's real answers are a few KB. The request is aborted
-  // as soon as the text passes the cap, and the caller gets status 0 and no
-  // data, like any failed call.
+  // An answer past restMaxChars is never parsed: the caller gets status 0
+  // and no data, like any failed call (deep review 2026-10-01: the whole
+  // answer was parsed on the UI thread, whatever its size; the app's real
+  // answers are a few KB). The transfer itself is not aborted: in Qt 6.11
+  // XMLHttpRequest.abort() while data is still arriving can crash the whole
+  // shell (QIODevice::readAll on the dropped reply, from a readyRead already
+  // queued; it took down the test runner twice in five runs).
   readonly property int restMaxChars: 4 * 1024 * 1024
+  // Shared with every call still on its way; marked when the widget goes.
+  readonly property var life: ({ alive: true })
+  Component.onDestruction: life.alive = false
   function call(method, path, body, cb) {
     var x = new XMLHttpRequest()
-    var over = false, answered = false
+    var cap = root.restMaxChars, life = root.life
     x.onreadystatechange = function() {
-      if (x.readyState === XMLHttpRequest.LOADING && !over && x.responseText.length > root.restMaxChars) {
-        over = true
-        x.abort()
-      }
-      if (x.readyState !== XMLHttpRequest.DONE || answered) return
-      answered = true
-      if (!cb) return
-      if (over || x.responseText.length > root.restMaxChars) { cb(0, null); return }
+      if (x.readyState !== XMLHttpRequest.DONE || !cb) return
+      // The widget went away meanwhile (a shell reload, a monitor unplugged):
+      // its callbacks would act on a destroyed object.
+      if (!life.alive) return
+      var t = x.responseText
+      if (t.length > cap) { cb(0, null); return }
       var data = null
-      try { data = x.responseText ? JSON.parse(x.responseText) : null } catch (e) {}
+      try { data = t ? JSON.parse(t) : null } catch (e) {}
       cb(x.status, data)
     }
     x.open(method, root.api + path)

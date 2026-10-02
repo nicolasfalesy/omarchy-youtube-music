@@ -3,10 +3,10 @@ import QtTest
 import YtmTest
 import "../.."
 
-// The REST calls to the app read the whole answer into the shell, with no
-// limit. An answer past 4 MiB is now cut off: the request is aborted and the
-// caller gets an error, like for a call that failed. (A stand-in API from
-// data/fakeapi.py, in the tests' own network namespace.)
+// The REST calls to the app parsed the whole answer on the UI thread, with no
+// limit. An answer past 4 MiB is now never parsed, and the caller gets an
+// error, like for a call that failed. (A stand-in API from data/fakeapi.py,
+// in the tests' own network namespace.)
 TestCase {
   id: tc
   name: "RestCap"
@@ -37,15 +37,24 @@ TestCase {
     compare(r.status, 200)
     compare(r.data.state, "LIKE")
   }
-  // An answer that never ends: without the cap the call never came back.
-  function test_endless_answer_is_cut_off() {
+  // A call still on its way when the widget goes (a shell reload, a monitor
+  // unplugged) ends quietly instead of throwing on the destroyed widget.
+  function test_answer_after_the_widget_is_gone() {
+    var w = widgetComp.createObject(tc, { api: "http://127.0.0.1:26599/api/v1" })
+    failOnWarning(/TypeError/)
+    var called = false
+    w.call("GET", "/slow", null, function() { called = true })
+    w.destroy()
+    wait(700)
+    compare(called, false)
+  }
+  // A 64 MiB answer: read (the transfer cannot be stopped safely, see
+  // call() in Widget.qml) but never parsed, and reported as a failure.
+  function test_huge_answer_is_not_taken() {
     var w = createTemporaryObject(widgetComp, tc, { api: "http://127.0.0.1:26599/api/v1" })
-    var r = get(w, "/endless")
+    var r = get(w, "/huge")
     compare(r.calls, 1)
     compare(r.data, null)
-    verify(r.status !== 200, "an endless answer was taken as a good one")
-    wait(300)
-    var st = stats(w)
-    verify(!st.hugeDone && st.hugeSent < 64 * 1024 * 1024, "the answer was read on and on: " + st.hugeSent + " bytes")
+    verify(r.status !== 200, "a 64 MiB answer was taken as a good one")
   }
 }
