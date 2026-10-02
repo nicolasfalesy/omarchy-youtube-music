@@ -17,8 +17,8 @@ $FAKE_LOG, so a test can check what reached the app:
     Bearer JWT (HS256, the config's secret) whose id is in authorizedClients.
     POST /auth/<id> mints a token, under NONE only. Each request is logged with
     whether it carried a valid token, never the token itself.
-Fake.big answers params.bytes of filler, Fake.event sends an event first,
-Fake.bad sends malformed messages before its answer.
+Runtime.evaluate of "fake.big:<bytes>", "fake.event" or "fake.bad" are test
+hooks (see fake()).
 Control files in $FAKE_CTL: noquit (ignore Browser.close and pipe EOF),
 mint_empty (mint answers {}), die_after_mint (exit right after a mint),
 spaced (answers as {"result": ..., "id": N}, not Chromium's compact form).
@@ -186,6 +186,23 @@ class App:
         while data:
             data = data[os.write(4, data):]
 
+    def fake(self, cmd, expr):
+        """Test hooks, reached through Runtime.evaluate (a method the bridge
+        lets through): fake.big:<bytes> answers that much filler, fake.event
+        sends an event first, fake.bad sends malformed messages first."""
+        if expr.startswith("fake.big:"):
+            return self.answer(cmd, {"blob": "x" * int(expr.split(":")[1])})
+        if expr == "fake.event":
+            self.send(json.dumps({"method": "Fake.event", "params": {}}, separators=(",", ":")).encode())
+        elif expr == "fake.bad":
+            # Odd things a broken peer could write: ids that are not numbers,
+            # nesting deeper than any parser allows, not JSON at all.
+            for junk in (b'{"id":[1],"result":{}}', b'{"id":{"a":1},"result":{}}',
+                         b'{"id":true,"result":{}}', b"[" * 200000 + b"]" * 200000,
+                         b"[1,2,3]", b"not json \xff"):
+                self.send(junk)
+        self.answer(cmd, {"after": expr})
+
     def serve_pipe(self):
         buf = b""
         while True:
@@ -204,19 +221,8 @@ class App:
                 if method == "Browser.close":
                     self.answer(cmd, {})
                     self.quit("Browser.close")
-                elif method == "Fake.big":
-                    self.answer(cmd, {"blob": "x" * int(params.get("bytes", 3_000_000))})
-                elif method == "Fake.bad":
-                    # Odd things a broken or hostile peer could write: ids that are
-                    # not numbers, nesting deeper than any parser allows, not JSON.
-                    for junk in (b'{"id":[1],"result":{}}', b'{"id":{"a":1},"result":{}}',
-                                 b'{"id":true,"result":{}}', b"[" * 200000 + b"]" * 200000,
-                                 b"[1,2,3]", b"not json \xff"):
-                        self.send(junk)
-                    self.answer(cmd, {"after": "bad"})
-                elif method == "Fake.event":
-                    self.send(json.dumps({"method": "Fake.event", "params": {}}, separators=(",", ":")).encode())
-                    self.answer(cmd, {})
+                elif method == "Runtime.evaluate" and str(params.get("expression", "")).startswith("fake."):
+                    self.fake(cmd, params["expression"])
                 elif method == "Target.getTargets":
                     self.answer(cmd, {"targetInfos": [{"type": "page", "url": "https://music.youtube.com/", "targetId": "T1"}]})
                 elif method == "Target.attachToTarget":

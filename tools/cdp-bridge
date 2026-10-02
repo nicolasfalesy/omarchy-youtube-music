@@ -14,6 +14,11 @@ app's parent and the only holder of those pipes. It serves them on
 $XDG_RUNTIME_DIR/nic-youtube-music/cdp.sock: the folder is 0700 and the socket
 0600, and each connection's peer uid is checked, so other users cannot reach it.
 
+Only the commands the widget and tools/lock-api send reach the app (see
+ALLOWED), and Page.navigate only to https://music.youtube.com/. Anything else
+gets a CDP error back, so a same-user program that reaches the socket cannot
+read cookies, open new pages or fetch arbitrary URLs through it.
+
 Framing: the pipe separates messages with a NUL byte; the socket uses a
 newline, which JSON text never contains raw, so the widget can split lines.
 
@@ -40,6 +45,7 @@ import stat
 import struct
 import sys
 import time
+from urllib.parse import urlsplit
 
 APP = os.environ.get("NIC_YTM_APP", "/opt/YouTube Music/youtube-music")
 FLAGS_FILE = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
@@ -125,6 +131,40 @@ def app_env():
     for name in ("NODE_OPTIONS", "ELECTRON_RUN_AS_NODE"):
         env.pop(name, None)
     return env
+
+
+# Every CDP method the widget (Widget.qml, cdpBare and cdpSend) and
+# tools/lock-api send, and nothing else. Runtime.evaluate is needed for the
+# page itself (Page.js); the rest of the protocol (Network.getAllCookies,
+# Storage.*, Target.createTarget, Browser.* and so on) reaches far beyond the
+# YouTube Music page, so it is refused (2026-10-01 review). Add a method
+# here when the widget starts sending one.
+ALLOWED = frozenset({"Target.getTargets", "Target.attachToTarget", "Runtime.evaluate",
+                     "Page.navigate", "Browser.close"})
+
+
+def music_url(url):
+    """Exactly https://music.youtube.com/...: no other scheme, host, port or
+    user part (the widget only ever navigates back to the app's own page)."""
+    if not isinstance(url, str):
+        return False
+    try:
+        u = urlsplit(url)
+    except ValueError:
+        return False
+    return u.scheme == "https" and u.netloc == "music.youtube.com"
+
+
+def refusal(msg):
+    """Why a client's command may not reach the app, or "" when it may."""
+    method = msg.get("method")
+    if not isinstance(method, str) or method not in ALLOWED:
+        return "method not allowed: " + str(method)[:100]
+    if method == "Page.navigate":
+        params = msg.get("params")
+        if not isinstance(params, dict) or not music_url(params.get("url")):
+            return "Page.navigate only goes to https://music.youtube.com/"
+    return ""
 
 
 def parse(raw):
@@ -253,6 +293,15 @@ def main():
             return
         del outq[conn][:sent]
 
+    def queue(conn, lines):
+        if conn not in clients:
+            return
+        outq[conn] += b"".join(line + b"\n" for line in lines)
+        if len(outq[conn]) > MAX_QUEUED:
+            drop(conn)
+        else:
+            flush(conn)
+
     def to_app(data):
         # A pipe write can be short when a signal lands mid-write.
         view = memoryview(data)
@@ -319,13 +368,7 @@ def main():
                         for conn in clients:
                             out.setdefault(conn, []).append(raw)
                 for conn, lines in out.items():
-                    if conn not in clients:
-                        continue
-                    outq[conn] += b"".join(line + b"\n" for line in lines)
-                    if len(outq[conn]) > MAX_QUEUED:
-                        drop(conn)
-                    else:
-                        flush(conn)
+                    queue(conn, lines)
             for conn in [c for c in ready if c in clients]:
                 try:
                     chunk = conn.recv(1 << 20)
@@ -344,6 +387,14 @@ def main():
                 for line in lines:
                     msg = parse(line)
                     if msg is None:
+                        continue
+                    why = refusal(msg)
+                    if why:
+                        if "id" in msg:
+                            err = {"id": msg["id"], "error": {"code": -32601, "message": "cdp-bridge: " + why}}
+                            if isinstance(msg.get("sessionId"), str):
+                                err["sessionId"] = msg["sessionId"]
+                            queue(conn, [dump(err) or b'{"error":{}}'])
                         continue
                     asked = "id" in msg
                     if asked:

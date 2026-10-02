@@ -24,7 +24,7 @@ class BridgeTest(Case):
         a, b = Conn(self.sock), Conn(self.sock)
         b.send({"id": 7, "method": "Target.getTargets", "params": {}})
         b.recv()  # b is registered before the event
-        a.send({"id": 1, "method": "Fake.event"})
+        a.send({"id": 1, "method": "Runtime.evaluate", "params": {"expression": "fake.event"}})
         got_a = [a.recv(), a.recv()]
         self.assertIn({"method": "Fake.event", "params": {}}, got_a)
         self.assertEqual(b.recv(), {"method": "Fake.event", "params": {}})
@@ -95,7 +95,7 @@ class BridgeTest(Case):
         self.bridge_up()
         stuck, other = Conn(self.sock), Conn(self.sock)
         # More than the socket buffers hold, and never read.
-        stuck.send({"id": 1, "method": "Fake.big", "params": {"bytes": 8_000_000}})
+        stuck.send({"id": 1, "method": "Runtime.evaluate", "params": {"expression": "fake.big:%d" % (8_000_000)}})
         time.sleep(0.3)
         other.send({"id": 1, "method": "Target.getTargets", "params": {}})
         self.assertEqual(other.recv(timeout=2)["id"], 1)
@@ -106,7 +106,7 @@ class BridgeTest(Case):
         p = self.bridge_up()
         stuck, other = Conn(self.sock), Conn(self.sock)
         for i in range(4):  # 96 MB queued for one reader: past the cap
-            stuck.send({"id": i, "method": "Fake.big", "params": {"bytes": 24_000_000}})
+            stuck.send({"id": i, "method": "Runtime.evaluate", "params": {"expression": "fake.big:%d" % (24_000_000)}})
         time.sleep(2)
         other.send({"id": 5, "method": "Target.getTargets", "params": {}})
         self.assertEqual(other.recv(timeout=5)["id"], 5)
@@ -118,8 +118,8 @@ class BridgeTest(Case):
     def test_malformed_messages_from_the_app_are_skipped(self):
         p = self.bridge_up()
         c = Conn(self.sock)
-        c.send({"id": 1, "method": "Fake.bad", "params": {}})
-        self.assertEqual(c.recv(), {"id": 1, "result": {"after": "bad"}})
+        c.send({"id": 1, "method": "Runtime.evaluate", "params": {"expression": "fake.bad"}})
+        self.assertEqual(c.recv(), {"id": 1, "result": {"after": "fake.bad"}})
         self.assertIsNone(p.poll())
 
     def test_malformed_lines_from_a_client_are_skipped(self):
@@ -135,7 +135,7 @@ class BridgeTest(Case):
     def test_an_answer_over_the_size_cap_becomes_an_error(self):
         self.bridge_up()
         c = Conn(self.sock)
-        c.send({"id": 1, "method": "Fake.big", "params": {"bytes": 40 * 1024 * 1024}})
+        c.send({"id": 1, "method": "Runtime.evaluate", "params": {"expression": "fake.big:%d" % (40 * 1024 * 1024)}})
         c.send({"id": 2, "method": "Target.getTargets", "params": {}})
         first = c.recv(timeout=20)
         self.assertEqual(first["id"], 1)
@@ -154,6 +154,43 @@ class BridgeTest(Case):
         good.send({"id": 3, "method": "Target.getTargets", "params": {}})
         self.assertEqual(good.recv()["id"], 3)
         self.assertIsNone(p.poll())
+
+    def test_only_the_methods_the_widget_uses_reach_the_app(self):
+        self.bridge_up()
+        c = Conn(self.sock)
+        refused = [
+            ("Network.getAllCookies", {}),
+            ("Storage.getCookies", {}),
+            ("Target.createTarget", {"url": "https://music.youtube.com/"}),
+            ("Target.exposeDevToolsProtocol", {"targetId": "T1"}),
+            ("Browser.setDownloadBehavior", {"behavior": "allow"}),
+            ("Page.navigate", {"url": "http://music.youtube.com/"}),
+            ("Page.navigate", {"url": "https://music.youtube.com.example.org/"}),
+            ("Page.navigate", {"url": "https://example.org/?u=https://music.youtube.com/"}),
+            ("Page.navigate", {"url": "https://user@music.youtube.com/"}),
+            ("Page.navigate", {"url": "https://music.youtube.com:8443/"}),
+            ("Page.navigate", {"url": "javascript:alert(1)"}),
+            ("Page.navigate", {"url": "file:///etc/passwd"}),
+            ("Page.navigate", {}),
+            ("Page.navigate", {"url": ["https://music.youtube.com/"]}),
+        ]
+        for i, (method, params) in enumerate(refused, 1):
+            c.send({"id": i, "method": method, "params": params, "sessionId": "S1"})
+            got = c.recv()
+            self.assertEqual(got["id"], i, method)
+            self.assertIn("error", got, "%s %s was let through" % (method, params))
+        allowed = [("Target.getTargets", {}), ("Target.attachToTarget", {"targetId": "T1", "flatten": True}),
+                   ("Runtime.evaluate", {"expression": "1"}), ("Page.navigate", {"url": "https://music.youtube.com/"}),
+                   ("Page.navigate", {"url": "https://music.youtube.com/library?x=1"})]
+        for i, (method, params) in enumerate(allowed, 100):
+            c.send({"id": i, "method": method, "params": params})
+            got = c.recv()
+            self.assertEqual(got["id"], i)
+            self.assertNotIn("error", got, method)
+        arrived = [(e["method"], e["url"]) for e in self.app_events("cdp")]
+        self.assertEqual(arrived, [(m, p.get("url")) for m, p in allowed])
+        c.send({"id": 200, "method": "Browser.close"})
+        self.assertEqual(c.recv()["id"], 200)
 
 
 def race_once(case):
