@@ -199,6 +199,27 @@ What the tests cannot reach, to try by hand after a change:
   never reports a play or pause at 0:00, and restores the last queue as a cued song on every
   start. The comments at the top of `Widget.qml` explain how the widget copes.
 
+### Where things are in Widget.qml
+
+`Widget.qml` is long (about 4,900 lines), so it is cut into sections. Each one starts with a
+`// ----...---- <name>` comment: search for the name to jump there. In file order:
+
+- **player state**: what is playing, position, volume, and how the widget decides whether the
+  app is really playing (see the notes at the top of the file).
+- **browse state**: Home, Library, playlists and the queue, all from one page snapshot.
+- **panel plumbing**: opening and closing the panel and its tabs.
+- **REST**: calls to the app's API server, and reading the token file.
+- **app lifecycle**: starting the app on demand through `tools/cdp-bridge`, idle quit, resume.
+- **live state socket**: the API's live updates, reconnects, and a turned-down token.
+- **page bridge (CDP)**: calls into the YouTube Music page (`Page.js`) with a time limit.
+- **lyrics**: synced lyrics from LRCLIB, word timing from KuGou (`---- word timing`), fetched with
+  curl and cached.
+- **first run**: installing and setting up the app from the panel.
+- **IPC**: the `omarchy-shell` commands (`quit`, play/pause and the rest).
+- **bar**: the bar entry and its tooltip.
+- **panel**: the popup itself. Its parts are marked `// ---------------- <part> ----------------`:
+  first run, app waking up or closed, now playing, browse, lyrics.
+
 ## Credits
 
 Built on Omarchy's Media bar widget (MIT, [basecamp/omarchy](https://github.com/basecamp/omarchy)).
