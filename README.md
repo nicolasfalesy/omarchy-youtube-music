@@ -1,5 +1,10 @@
 # YouTube Music for the Omarchy bar
 
+> **No longer updated (October 2026).** Version 2.4.0 is the last release. It still works as it
+> is, but it won't get fixes or new features. The author's own setup moved to a private widget
+> built on [ytmfast](https://github.com/nicolasfalesy/ytmfast), a headless YouTube Music engine
+> written in Rust, so this pear-desktop version is no longer used or tested.
+
 A bar widget for [Omarchy](https://omarchy.org) 4 that turns the YouTube Music desktop app
 ([pear-desktop](https://github.com/pear-devs/pear-desktop)) into a full remote. The app runs
 hidden in the background, starts when you need it, and quits when you don't.
